@@ -1,0 +1,532 @@
+#!/usr/bin/env python3
+"""App Manager — a safe GTK GUI to list, uninstall, and manage startup of programs on Linux.
+
+Two tabs:
+  • Installed Programs — enumerate apps from apt / snap / flatpak, search & filter, and UNINSTALL
+    one at a time. Uninstalling is destructive and can cascade, so this is safe-by-default:
+      - apt removals are SIMULATED first (`apt-get -s remove`) and the full set of packages that
+        would be removed is shown for confirmation;
+      - an essential/desktop-critical guard refuses removals that would take out the base system
+        (zorin*, gnome-shell, gdm3, xorg, systemd, the kernel, apt/dpkg, libc6, …);
+      - privileged actions run through `pkexec` (a graphical auth prompt) — no stored passwords;
+      - `remove` (not `purge`) is the default; purge is an explicit opt-in for apt.
+  • Startup Apps — the "edit" side: enable/disable/remove autostart entries. This is user-level
+    (no root) and is the safe way to cut what runs at login (and the CPU it costs).
+
+Backend is usable headlessly for verification / scripting:
+    app-manager.py --list [--json]     list everything it can see
+    app-manager.py --check <pkg>       show what an apt removal of <pkg> would take, and whether
+                                       it is blocked by the essential-package guard
+Run with no arguments to launch the GUI.
+"""
+from __future__ import annotations
+
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import threading
+
+# ── essential / desktop-critical packages the uninstaller must never remove ───────────────────
+# Removing any of these (directly or via cascade) would break the desktop or the base system.
+_PROTECTED_RE = re.compile(
+    r"^(zorin[\w.-]*|ubuntu-desktop[\w.-]*|gnome-shell|gnome-session[\w.-]*|gdm3|mutter[\w.-]*|"
+    r"nautilus[\w.-]*|xorg|xserver-xorg[\w.-]*|xwayland|wayland[\w.-]*|systemd[\w.-]*|init|"
+    r"libc6[\w.-]*|bash|dash|coreutils|dpkg|apt|apt-utils|libapt[\w.-]*|libpam[\w.-]*|"
+    r"policykit-1|polkitd|pkexec|sudo|dbus[\w.-]*|network-manager[\w.-]*|plymouth[\w.-]*|"
+    r"grub[\w.-]*|linux-image[\w.-]*|linux-generic[\w.-]*|linux-headers[\w.-]*|"
+    r"linux-firmware|libgtk[\w.-]*|libglib[\w.-]*|python3(\.\d+)?|perl-base)$"
+)
+_PROTECTED_SNAP = {"snapd", "core", "core18", "core20", "core22", "core24", "bare",
+                   "gnome-42-2204", "gtk-common-themes"}
+
+
+def is_protected(name: str, source: str = "apt") -> bool:
+    if source == "snap":
+        return name in _PROTECTED_SNAP or name.startswith(("gnome-", "gtk-", "kde-"))
+    return bool(_PROTECTED_RE.match(name))
+
+
+def _run(argv: list[str], timeout: int = 120) -> tuple[int, str, str]:
+    """Run a command safely (argv list, never a shell string). Returns (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, check=False)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]}: not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{argv[0]}: timed out"
+
+
+def _human_kb(kb: int) -> str:
+    mb = kb / 1024
+    return f"{mb/1024:.1f} GB" if mb >= 1024 else (f"{mb:.0f} MB" if mb else "-")
+
+
+# ── enumeration ───────────────────────────────────────────────────────────────────────────────
+def list_apt() -> list[dict]:
+    if not shutil.which("dpkg-query"):
+        return []
+    manual = set(_run(["apt-mark", "showmanual"])[1].split())
+    fmt = "${Package}\t${Version}\t${Installed-Size}\t${binary:Summary}\n"
+    _, out, _ = _run(["dpkg-query", "-W", "-f", fmt])
+    rows = []
+    for line in out.splitlines():
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        pkg, ver, size = parts[0], parts[1], parts[2]
+        summary = parts[3] if len(parts) > 3 else ""
+        if manual and pkg not in manual:  # show only user-requested packages, not the library soup
+            continue
+        try:
+            kb = int(size)
+        except ValueError:
+            kb = 0
+        rows.append({"source": "apt", "id": pkg, "name": pkg, "version": ver,
+                     "size": _human_kb(kb), "summary": summary, "protected": is_protected(pkg)})
+    return rows
+
+
+def list_snap() -> list[dict]:
+    if not shutil.which("snap"):
+        return []
+    _, out, _ = _run(["snap", "list"])
+    rows = []
+    for line in out.splitlines()[1:]:  # skip header
+        f = line.split()
+        if len(f) < 2:
+            continue
+        name, ver = f[0], f[1]
+        rows.append({"source": "snap", "id": name, "name": name, "version": ver,
+                     "size": "-", "summary": " ".join(f[5:]) if len(f) > 5 else "",
+                     "protected": is_protected(name, "snap")})
+    return rows
+
+
+def list_flatpak() -> list[dict]:
+    if not shutil.which("flatpak"):
+        return []
+    cols = "application,name,version,size,installation"
+    _, out, _ = _run(["flatpak", "list", "--app", f"--columns={cols}"])
+    rows = []
+    for line in out.splitlines():
+        f = line.split("\t")
+        if len(f) < 2 or not f[0]:
+            continue
+        app_id = f[0]
+        rows.append({"source": "flatpak", "id": app_id, "name": f[1] or app_id,
+                     "version": f[2] if len(f) > 2 else "",
+                     "size": f[3] if len(f) > 3 else "-",
+                     "installation": f[4] if len(f) > 4 else "user",
+                     "summary": "", "protected": False})
+    return rows
+
+
+def list_all() -> list[dict]:
+    rows = list_apt() + list_snap() + list_flatpak()
+    rows.sort(key=lambda r: (r["source"], r["name"].lower()))
+    return rows
+
+
+# ── removal planning (safety) ──────────────────────────────────────────────────────────────────
+def simulate_apt_remove(pkg: str, purge: bool = False) -> tuple[list[str], list[str]]:
+    """Return (packages_that_would_be_removed, protected_ones_in_that_set) — no changes made."""
+    op = "purge" if purge else "remove"
+    rc, out, err = _run(["apt-get", "-s", op, pkg])
+    removed = [ln.split()[1] for ln in out.splitlines()
+               if ln.startswith("Remv ") and len(ln.split()) > 1]
+    if not removed and rc != 0:
+        removed = []  # simulation failed (e.g. package not found); caller handles empty
+    protected = [p for p in removed if is_protected(p)]
+    return removed, protected
+
+
+def remove_command(item: dict, purge: bool = False) -> list[str]:
+    """Build the argv for uninstalling `item`. apt/snap/system-flatpak escalate via pkexec."""
+    src, ident = item["source"], item["id"]
+    if src == "apt":
+        op = "purge" if purge else "remove"
+        return ["pkexec", "apt-get", op, "-y", ident]
+    if src == "snap":
+        return ["pkexec", "snap", "remove", ident]
+    if src == "flatpak":
+        base = ["flatpak", "uninstall", "-y", ident]
+        return ["pkexec", *base] if item.get("installation") == "system" else base
+    raise ValueError(f"unknown source {src}")
+
+
+# ── autostart ("Startup Apps" / the edit side) ──────────────────────────────────────────────────
+_USER_AUTOSTART = os.path.expanduser("~/.config/autostart")
+_SYS_AUTOSTART = "/etc/xdg/autostart"
+
+
+def _desktop_field(path: str, key: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith(key + "="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+def _autostart_enabled(path: str) -> bool:
+    if _desktop_field(path, "Hidden").lower() == "true":
+        return False
+    val = _desktop_field(path, "X-GNOME-Autostart-enabled").lower()
+    return val != "false"
+
+
+def list_autostart() -> list[dict]:
+    items, seen = [], set()
+    for path in sorted(glob.glob(os.path.join(_USER_AUTOSTART, "*.desktop"))):
+        base = os.path.basename(path)
+        seen.add(base)
+        items.append({"name": _desktop_field(path, "Name") or base, "path": path,
+                      "kind": "user", "enabled": _autostart_enabled(path)})
+    for path in sorted(glob.glob(os.path.join(_SYS_AUTOSTART, "*.desktop"))):
+        base = os.path.basename(path)
+        if base in seen:  # a user override already shown above wins
+            continue
+        override = os.path.join(_USER_AUTOSTART, base)
+        enabled = _autostart_enabled(override) if os.path.exists(override) else True
+        items.append({"name": _desktop_field(path, "Name") or base, "path": path,
+                      "kind": "system", "enabled": enabled})
+    items.sort(key=lambda i: i["name"].lower())
+    return items
+
+
+def set_autostart_enabled(item: dict, enabled: bool) -> None:
+    """Enable/disable an autostart entry at the USER level only (no root, fully reversible)."""
+    os.makedirs(_USER_AUTOSTART, exist_ok=True)
+    base = os.path.basename(item["path"])
+    target = os.path.join(_USER_AUTOSTART, base)
+    if item["kind"] == "system" and not os.path.exists(target):
+        shutil.copyfile(item["path"], target)  # copy the system entry, then toggle our copy
+    lines, wrote = [], False
+    with open(target, encoding="utf-8", errors="replace") as fh:
+        for line in fh:
+            if line.startswith("X-GNOME-Autostart-enabled=") or line.startswith("Hidden="):
+                continue  # drop old state lines; we rewrite them
+            lines.append(line.rstrip("\n"))
+            if line.strip() == "[Desktop Entry]" and not wrote:
+                lines.append(f"X-GNOME-Autostart-enabled={'true' if enabled else 'false'}")
+                lines.append(f"Hidden={'false' if enabled else 'true'}")
+                wrote = True
+    if not wrote:  # no [Desktop Entry] header found; prepend a minimal one
+        lines = ["[Desktop Entry]",
+                 f"X-GNOME-Autostart-enabled={'true' if enabled else 'false'}",
+                 f"Hidden={'false' if enabled else 'true'}", *lines]
+    with open(target, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
+def remove_autostart(item: dict) -> None:
+    """Remove a USER autostart entry (deletes the file). System entries are disabled, not deleted."""
+    if item["kind"] == "user":
+        try:
+            os.remove(item["path"])
+        except OSError:
+            pass
+    else:
+        set_autostart_enabled(item, False)
+
+
+# ── CLI (headless verification / scripting) ─────────────────────────────────────────────────────
+def _cli(argv: list[str]) -> int:
+    if "--check" in argv:
+        i = argv.index("--check")
+        if i + 1 >= len(argv):
+            print("usage: --check <apt-package>")
+            return 2
+        pkg = argv[i + 1]
+        removed, protected = simulate_apt_remove(pkg)
+        if not removed:
+            print(f"{pkg}: not installed, or nothing to remove.")
+            return 1
+        print(f"Removing '{pkg}' via apt would remove {len(removed)} package(s):")
+        for p in removed:
+            print(f"  - {p}" + ("   [PROTECTED]" if is_protected(p) else ""))
+        if protected:
+            print(f"\nBLOCKED: this would remove essential package(s): {', '.join(protected)}")
+            return 3
+        print("\nOK: no essential packages in the removal set.")
+        return 0
+    rows = list_all()
+    if "--json" in argv:
+        print(json.dumps(rows, indent=2))
+    else:
+        print(f"{'SOURCE':7} {'SIZE':>9}  NAME")
+        for r in rows:
+            flag = " *protected" if r["protected"] else ""
+            print(f"{r['source']:7} {r['size']:>9}  {r['name']}{flag}")
+        print(f"\n{len(rows)} program(s): "
+              f"{sum(r['source']=='apt' for r in rows)} apt, "
+              f"{sum(r['source']=='snap' for r in rows)} snap, "
+              f"{sum(r['source']=='flatpak' for r in rows)} flatpak")
+    return 0
+
+
+# ── GUI ─────────────────────────────────────────────────────────────────────────────────────────
+def run_gui() -> int:
+    import gi
+    gi.require_version("Gtk", "3.0")
+    from gi.repository import GLib, Gtk, Pango
+
+    class AppManager(Gtk.Window):
+        def __init__(self):
+            super().__init__(title="App Manager")
+            self.set_default_size(900, 620)
+            self._rows: list[dict] = []
+            nb = Gtk.Notebook()
+            self.add(nb)
+            nb.append_page(self._programs_tab(), Gtk.Label(label="Installed Programs"))
+            nb.append_page(self._startup_tab(), Gtk.Label(label="Startup Apps"))
+            self.connect("destroy", Gtk.main_quit)
+            self.refresh_programs()
+            self.refresh_startup()
+
+        # -- programs tab --
+        def _programs_tab(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=8)
+            bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.search = Gtk.SearchEntry()
+            self.search.set_placeholder_text("Search programs…")
+            self.search.connect("search-changed", lambda *_: self.filter.refilter())
+            self.src = Gtk.ComboBoxText()
+            for s in ("all sources", "apt", "snap", "flatpak"):
+                self.src.append_text(s)
+            self.src.set_active(0)
+            self.src.connect("changed", lambda *_: self.filter.refilter())
+            refresh = Gtk.Button(label="Refresh")
+            refresh.connect("clicked", lambda *_: self.refresh_programs())
+            bar.pack_start(self.search, True, True, 0)
+            bar.pack_start(self.src, False, False, 0)
+            bar.pack_start(refresh, False, False, 0)
+            box.pack_start(bar, False, False, 0)
+
+            # name, source, version, size, id, protected(bool hidden)
+            self.store = Gtk.ListStore(str, str, str, str, str, bool)
+            self.filter = self.store.filter_new()
+            self.filter.set_visible_func(self._row_visible)
+            view = Gtk.TreeView(model=self.filter)
+            for i, title in enumerate(("Name", "Source", "Version", "Size")):
+                r = Gtk.CellRendererText()
+                r.set_property("ellipsize", Pango.EllipsizeMode.END)
+                col = Gtk.TreeViewColumn(title, r, text=i)
+                col.set_resizable(True)
+                col.set_expand(i == 0)
+                view.append_column(col)
+            self.view = view
+            sw = Gtk.ScrolledWindow()
+            sw.add(view)
+            box.pack_start(sw, True, True, 0)
+
+            act = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            self.purge = Gtk.CheckButton(label="purge config too (apt)")
+            rm = Gtk.Button(label="Uninstall selected")
+            rm.get_style_context().add_class("destructive-action")
+            rm.connect("clicked", lambda *_: self.on_uninstall())
+            self.status = Gtk.Label(label="", xalign=0)
+            self.status.set_ellipsize(Pango.EllipsizeMode.END)
+            act.pack_start(self.purge, False, False, 0)
+            act.pack_start(rm, False, False, 0)
+            act.pack_start(self.status, True, True, 0)
+            box.pack_start(act, False, False, 0)
+            return box
+
+        def _row_visible(self, model, it, _data=None):
+            q = self.search.get_text().lower()
+            src = self.src.get_active_text() or "all sources"
+            name = (model[it][0] or "").lower()
+            source = model[it][1]
+            if src != "all sources" and source != src:
+                return False
+            return q in name or q in source
+
+        def refresh_programs(self):
+            self.status.set_text("loading…")
+
+            def work():
+                rows = list_all()
+                GLib.idle_add(self._fill_programs, rows)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _fill_programs(self, rows):
+            self._rows = rows
+            self.store.clear()
+            for r in rows:
+                self.store.append([r["name"], r["source"], r["version"], r["size"],
+                                   r["id"], r["protected"]])
+            self.status.set_text(f"{len(rows)} programs")
+            return False
+
+        def _selected(self):
+            model, it = self.view.get_selection().get_selected()
+            if not it:
+                return None
+            ident, source = model[it][4], model[it][1]
+            return next((r for r in self._rows
+                         if r["id"] == ident and r["source"] == source), None)
+
+        def on_uninstall(self):
+            item = self._selected()
+            if not item:
+                self._msg(Gtk.MessageType.INFO, "Select a program to uninstall first.")
+                return
+            if item["protected"]:
+                self._msg(Gtk.MessageType.ERROR,
+                          f"'{item['name']}' is a protected/essential component and cannot be "
+                          "removed from here — doing so could break your desktop.")
+                return
+            self.status.set_text(f"planning removal of {item['name']}…")
+
+            def work():
+                if item["source"] == "apt":
+                    removed, protected = simulate_apt_remove(item["id"], self.purge.get_active())
+                else:
+                    removed, protected = [item["id"]], []
+                GLib.idle_add(self._confirm_remove, item, removed, protected)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _confirm_remove(self, item, removed, protected):
+            self.status.set_text("")
+            if item["source"] == "apt" and not removed:
+                self._msg(Gtk.MessageType.WARNING,
+                          f"apt reports nothing to remove for '{item['id']}'.")
+                return False
+            if protected:
+                self._msg(Gtk.MessageType.ERROR,
+                          f"Refusing: removing '{item['name']}' would also remove essential "
+                          f"package(s): {', '.join(protected)}.")
+                return False
+            if item["source"] == "apt" and len(removed) > 1:
+                detail = "This will remove the following packages:\n\n  " + "\n  ".join(removed)
+            else:
+                detail = f"This will uninstall '{item['name']}' ({item['source']})."
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                    message_type=Gtk.MessageType.QUESTION,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text=f"Uninstall {item['name']}?")
+            dlg.format_secondary_text(detail + "\n\nYou'll be asked for your password.")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp == Gtk.ResponseType.OK:
+                self._exec_remove(item)
+            return False
+
+        def _exec_remove(self, item):
+            self.status.set_text(f"uninstalling {item['name']}…")
+            argv = remove_command(item, self.purge.get_active())
+
+            def work():
+                rc, out, err = _run(argv, timeout=600)
+                GLib.idle_add(self._done_remove, item, rc, out, err)
+            threading.Thread(target=work, daemon=True).start()
+
+        def _done_remove(self, item, rc, out, err):
+            if rc == 0:
+                self.status.set_text(f"removed {item['name']}")
+                self.refresh_programs()
+            elif rc == 126:  # pkexec: user dismissed / not authorized
+                self.status.set_text("cancelled (authentication dismissed)")
+            else:
+                self.status.set_text(f"failed to remove {item['name']} (exit {rc})")
+                self._msg(Gtk.MessageType.ERROR, (err or out or "unknown error").strip()[:600])
+            return False
+
+        # -- startup tab --
+        def _startup_tab(self):
+            box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6, border_width=8)
+            box.pack_start(Gtk.Label(
+                label="Turn things off to run less at login (safe & reversible). "
+                      "System entries are disabled for your user, not deleted.",
+                xalign=0, wrap=True), False, False, 0)
+            self.au_store = Gtk.ListStore(bool, str, str, str)  # enabled, name, kind, path
+            view = Gtk.TreeView(model=self.au_store)
+            toggle = Gtk.CellRendererToggle()
+            toggle.connect("toggled", self._on_toggle_startup)
+            view.append_column(Gtk.TreeViewColumn("On", toggle, active=0))
+            for i, title in ((1, "Name"), (2, "Type")):
+                col = Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=i)
+                col.set_expand(i == 1)
+                view.append_column(col)
+            self.au_view = view
+            sw = Gtk.ScrolledWindow()
+            sw.add(view)
+            box.pack_start(sw, True, True, 0)
+            act = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            ref = Gtk.Button(label="Refresh")
+            ref.connect("clicked", lambda *_: self.refresh_startup())
+            rm = Gtk.Button(label="Remove selected")
+            rm.connect("clicked", lambda *_: self.on_remove_startup())
+            act.pack_start(ref, False, False, 0)
+            act.pack_start(rm, False, False, 0)
+            box.pack_start(act, False, False, 0)
+            return box
+
+        def refresh_startup(self):
+            self._au = list_autostart()
+            self.au_store.clear()
+            for a in self._au:
+                self.au_store.append([a["enabled"], a["name"], a["kind"], a["path"]])
+            return False
+
+        def _on_toggle_startup(self, _renderer, path):
+            row = self.au_store[path]
+            item = next((a for a in self._au if a["path"] == row[3]), None)
+            if not item:
+                return
+            try:
+                set_autostart_enabled(item, not row[0])
+                row[0] = not row[0]
+                item["enabled"] = row[0]
+            except OSError as exc:
+                self._msg(Gtk.MessageType.ERROR, f"Could not change autostart: {exc}")
+
+        def on_remove_startup(self):
+            model, it = self.au_view.get_selection().get_selected()
+            if not it:
+                return
+            item = next((a for a in self._au if a["path"] == model[it][3]), None)
+            if not item:
+                return
+            verb = "Delete" if item["kind"] == "user" else "Disable"
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True,
+                                    message_type=Gtk.MessageType.QUESTION,
+                                    buttons=Gtk.ButtonsType.OK_CANCEL,
+                                    text=f"{verb} startup entry '{item['name']}'?")
+            resp = dlg.run()
+            dlg.destroy()
+            if resp == Gtk.ResponseType.OK:
+                remove_autostart(item)
+                self.refresh_startup()
+
+        def _msg(self, kind, text):
+            dlg = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
+                                    buttons=Gtk.ButtonsType.OK, text=text)
+            dlg.run()
+            dlg.destroy()
+
+    win = AppManager()
+    win.show_all()
+    Gtk.main()
+    return 0
+
+
+def main(argv: list[str]) -> int:
+    if any(a in argv for a in ("--list", "--check", "--json")):
+        return _cli(argv)
+    if "-h" in argv or "--help" in argv:
+        print(__doc__)
+        return 0
+    return run_gui()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
