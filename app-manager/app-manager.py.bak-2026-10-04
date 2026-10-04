@@ -23,16 +23,11 @@ Backend is usable headlessly for verification / scripting:
                                        it is blocked by the essential-package guard
     app-manager.py --monitor [--json]  one system-monitor snapshot (CPU, memory, temperatures,
                                        GPU, busiest programs)
-    app-manager.py --startup [--json]  what starts at login, and what really runs
-    app-manager.py --cleanup [--json]  what could be cleaned up, item by item (changes nothing)
 Run with no arguments to launch the GUI.
 """
 from __future__ import annotations
 
-__version__ = "4.0"
-
 import collections
-import concurrent.futures
 import glob
 import json
 import os
@@ -83,67 +78,31 @@ def _human_kb(kb: int) -> str:
 
 
 # ── enumeration (the whole machine, not just what you installed) ─────────────────────────────
-_APT_STATES = "/var/lib/apt/extended_states"
-_DPKG_INFO = "/var/lib/dpkg/info"
-
-
-def _apt_auto_installed() -> set[tuple[str, str]] | None:
-    """(package, arch) pairs APT marked as installed automatically, read from its state file.
-    `apt-mark showmanual` gives the same answer (checked: 296 = 296 here) but takes 1.5–7 s."""
-    try:
-        with open(_APT_STATES, encoding="utf-8", errors="replace") as fh:
-            text = fh.read()
-    except OSError:
-        return None
-    auto = set()
-    for block in text.split("\n\n"):
-        fields = dict(line.split(": ", 1) for line in block.splitlines() if ": " in line)
-        if fields.get("Auto-Installed") == "1":
-            auto.add((fields.get("Package", ""), fields.get("Architecture", "")))
-    return auto
-
-
-def _mtime(path: str) -> float:
-    try:
-        return os.stat(path).st_mtime
-    except OSError:
-        return 0.0
-
-
 def list_apt() -> list[dict]:
     """Every installed dpkg package. `manual` marks the ones a person explicitly asked for; the
     rest came with the OS or as dependencies."""
     if not shutil.which("dpkg-query"):
         return []
-    auto = _apt_auto_installed()
-    manual = set() if auto is not None else set(_run(["apt-mark", "showmanual"])[1].split())
-    native = _run(["dpkg", "--print-architecture"])[1].strip()
-    fmt = ("${db:Status-Abbrev}\t${binary:Package}\t${Architecture}\t${Version}\t"
-           "${Installed-Size}\t${binary:Summary}\n")
+    manual = set(_run(["apt-mark", "showmanual"])[1].split())
+    fmt = ("${db:Status-Abbrev}\t${binary:Package}\t${Version}\t${Installed-Size}\t"
+           "${binary:Summary}\n")
     _, out, _ = _run(["dpkg-query", "-W", "-f", fmt])
     rows = []
     for line in out.splitlines():
         parts = line.split("\t")
-        if len(parts) < 5 or parts[0][1:2] != "i":  # skip removed-but-config-left ("rc") etc.
+        if len(parts) < 4 or parts[0][1:2] != "i":  # skip removed-but-config-left ("rc") etc.
             continue
-        ident, arch, ver, size = parts[1], parts[2], parts[3], parts[4]
+        ident, ver, size = parts[1], parts[2], parts[3]
         pkg = ident.split(":")[0]
         try:
             kb = int(size)
         except ValueError:
             kb = 0
-        if auto is not None:  # "Architecture: all" packages are recorded under the native arch
-            is_manual = (pkg, native if arch == "all" else arch) not in auto
-        else:
-            is_manual = pkg in manual or ident in manual
         rows.append({"source": "apt", "id": ident, "name": pkg, "version": ver,
                      "size": _human_kb(kb), "size_kb": kb,
-                     "summary": parts[5] if len(parts) > 5 else "",
-                     "manual": is_manual, "protected": is_protected(pkg),
-                     # dpkg rewrites a package's file list on every install or upgrade
-                     # (named pkg:arch.list only while two architectures are installed)
-                     "installed": _mtime(os.path.join(_DPKG_INFO, ident + ".list"))
-                     or _mtime(os.path.join(_DPKG_INFO, pkg + ".list"))})
+                     "summary": parts[4] if len(parts) > 4 else "",
+                     "manual": pkg in manual or ident in manual,
+                     "protected": is_protected(pkg)})
     return rows
 
 
@@ -184,20 +143,8 @@ def list_flatpak() -> list[dict]:
 
 
 def list_all() -> list[dict]:
-    # these mostly wait on subprocesses, so run them side by side (the folder walks below gain
-    # nothing from threads: they're bound by the GIL)
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as pool:
-        lists = [pool.submit(f) for f in (list_apt, list_snap, list_flatpak,
-                                          list_flatpak_runtimes)]
-        vendor = pool.submit(vendor_paths)
-        rows = [r for f in lists for r in f.result()]
-        vendor = vendor.result()
-    rows += windows_programs(attach_launchers(rows))
-    rows += list_unpackaged(rows, vendor)
-    for r in rows:
-        r["installed"] = _installed_time(r)
-        if r["source"] == "local":
-            r["action"] = local_action(r)
+    rows = list_apt() + list_snap() + list_flatpak()
+    attach_launchers(rows)
     rows.sort(key=lambda r: (r["source"], r["name"].lower()))
     return rows
 
@@ -264,8 +211,6 @@ def _visible_launcher(entry: dict) -> bool:
     if (entry.get("NoDisplay", "").lower() == "true" or entry.get("Hidden", "").lower() == "true"
             or entry.get("Type", "Application") != "Application"):
         return False
-    if entry.get("TryExec") and not shutil.which(entry["TryExec"]):
-        return False  # its program isn't installed, so the menu ignores it (vim.desktop w/o vim)
     desktops = {d.lower() for d in os.environ.get("XDG_CURRENT_DESKTOP", "GNOME").split(":")}
     only = {d.lower() for d in entry.get("OnlyShowIn", "").split(";") if d}
     never = {d.lower() for d in entry.get("NotShowIn", "").split(";") if d}
@@ -337,43 +282,19 @@ def _classify_local(argv: list[str], binary: str) -> tuple[str, str]:
     return "Launcher only", "Its program wasn't found — this launcher may be left over."
 
 
-def _sandbox_target(argv: list[str]) -> tuple[str, str] | None:
-    """('flatpak', app-id) or ('snap', name) when a launcher only starts a Flatpak / Snap app."""
-    if not argv:
-        return None
-    prog = os.path.basename(argv[0])
-    if prog == "flatpak" and "run" in argv:
-        app = next((a for a in argv[argv.index("run") + 1:] if not a.startswith("-")), "")
-        return ("flatpak", app) if app else None
-    if prog == "snap" and len(argv) > 2 and argv[1] == "run":
-        return "snap", argv[2].split(".")[0]
-    if argv[0].startswith("/snap/bin/"):
-        return "snap", prog.split(".")[0]
-    return None
-
-
-def scan_launchers(include_hidden: bool = False) -> list[dict]:
+def scan_launchers() -> list[dict]:
     """Every visible launcher, honouring user overrides (the same desktop-id in a
-    higher-precedence dir hides the lower one — exactly what the desktop menu does).
-    Sub-folders count too: per the XDG spec wine/Programs/X/Y.desktop is the desktop-id
-    wine-Programs-X-Y.desktop — that's where Wine puts every Windows program's menu entry."""
+    higher-precedence dir hides the lower one — exactly what the desktop menu does)."""
     found, seen = [], set()
     for d in application_dirs():
-        for root, subdirs, files in os.walk(d):
-            subdirs.sort()
-            for fn in sorted(files):
-                if not fn.endswith(".desktop"):
-                    continue
-                path = os.path.join(root, fn)
-                rel = os.path.relpath(path, d)
-                did = rel.replace(os.sep, "-")
-                if did in seen:
-                    continue
-                seen.add(did)
-                entry = read_desktop(path)
-                if include_hidden or _visible_launcher(entry):
-                    found.append({"id": did, "rel": rel, "path": path, "dir": d,
-                                  "entry": entry})
+        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
+            did = os.path.basename(path)
+            if did in seen:
+                continue
+            seen.add(did)
+            entry = read_desktop(path)
+            if _visible_launcher(entry):
+                found.append({"id": did, "path": path, "dir": d, "entry": entry})
     return found
 
 
@@ -391,22 +312,21 @@ def _dpkg_owners(paths: list[str]) -> dict[str, list[str]]:
     return owners
 
 
-def attach_launchers(rows: list[dict]) -> list[dict]:
+def attach_launchers(rows: list[dict]) -> None:
     """Map every launcher on the machine to the package that owns it; launchers nothing owns
-    become 'local' rows (web apps, AppImages, manual installs, scripts). Launchers that start a
-    Windows program are set aside and returned, for windows_programs()."""
+    become 'local' rows (web apps, AppImages, manual installs, scripts)."""
     for r in rows:
         r.setdefault("icon", "")
         r.setdefault("desktop", "")
         r["package_name"] = r["name"]
-        r["is_app"] = r["source"] == "flatpak" and not r.get("runtime")  # `--app` rows
+        r["is_app"] = r["source"] == "flatpak"  # `flatpak list --app` is apps only
 
     apt_rows: dict[str, dict] = {}
     for r in rows:
         if r["source"] == "apt":
             apt_rows.setdefault(r["name"], r)
     snaps = {r["id"]: r for r in rows if r["source"] == "snap"}
-    flatpaks = {r["id"]: r for r in rows if r["source"] == "flatpak" and not r.get("runtime")}
+    flatpaks = {r["id"]: r for r in rows if r["source"] == "flatpak"}
     flatpak_dirs = {os.path.realpath(d) for d in _FLATPAK_APPDIRS}
     app_dirs = application_dirs()
 
@@ -421,18 +341,7 @@ def attach_launchers(rows: list[dict]) -> list[dict]:
     unowned = []
     for ln in scan_launchers():
         stem = ln["id"][:-len(".desktop")]
-        ln["argv"] = _exec_argv(ln["entry"])
-        # a launcher that only starts a Flatpak / Snap belongs to that app, whoever wrote the
-        # file (Zorin ships its own com.usebottles.bottles.desktop that runs the Bottles flatpak)
-        kind, target = _sandbox_target(ln["argv"]) or ("", "")
-        if kind == "flatpak" and target in flatpaks:
-            claim(flatpaks[target], ln, 2 if target == stem else 1)
-            continue
-        if kind == "snap" and target in snaps:
-            claim(snaps[target], ln, 1)
-            continue
-        # a Flatpak's exported launcher, or a user override of it (it keeps the app-id as name)
-        if ln["dir"] in flatpak_dirs or stem in flatpaks:
+        if ln["dir"] in flatpak_dirs:
             fp = flatpaks.get(stem) or next((v for k, v in flatpaks.items()
                                              if stem.startswith(k + ".")), None)
             if fp:
@@ -447,36 +356,26 @@ def attach_launchers(rows: list[dict]) -> list[dict]:
 
     # 1) launcher files dpkg installed itself (a user override of the same id still counts)
     def same_id_paths(ln):
-        return [p for p in (os.path.join(d, ln["rel"]) for d in app_dirs) if os.path.exists(p)]
+        return [p for p in (os.path.join(d, ln["id"]) for d in app_dirs) if os.path.exists(p)]
 
-    # one dpkg lookup for the launcher files *and* the programs they run (step 2 needs those):
-    # each dpkg-query -S call costs ~0.7 s just to load dpkg's file database
-    for ln in unowned:
-        ln["binary"] = _exec_binary(ln["argv"])
-    owners = _dpkg_owners(sorted(
-        {p for ln in unowned for p in same_id_paths(ln)}
-        | {p for ln in unowned if ln["binary"]
-           for p in (ln["binary"], os.path.realpath(ln["binary"])) if os.path.exists(p)}))
+    owners = _dpkg_owners(sorted({p for ln in unowned for p in same_id_paths(ln)}))
     rest = []
     for ln in unowned:
         stem = ln["id"][:-len(".desktop")]
         pkgs = next((owners[p] for p in same_id_paths(ln) if p in owners), [])
         rows_for = [apt_rows[p] for p in pkgs if p in apt_rows]
         for row in rows_for:
-            pkg = row["package_name"]  # not row["name"]: claim() renames it to the launcher's Name
-            claim(row, ln, 2 if stem == pkg else (1 if stem.startswith(pkg) else 0))
+            claim(row, ln, 2 if stem == row["name"] else (1 if stem.startswith(row["name"]) else 0))
         if not rows_for:
             rest.append(ln)
 
-    # 2) launchers dpkg didn't install: Windows programs (Wine writes one per Start-menu entry)
-    #    are handled by windows_programs(); the rest are attributed by the program they run
-    wine = []
+    # 2) launchers dpkg didn't install: attribute by the program they run, else they're local apps
     for ln in rest:
-        ln["wine"] = _wine_launch(ln)
-        if ln["wine"]:
-            wine.append(ln)
-    rest = [ln for ln in rest if not ln["wine"]]
-    bin_owners = owners
+        ln["argv"] = _exec_argv(ln["entry"])
+        ln["binary"] = _exec_binary(ln["argv"])
+    bins = sorted({p for ln in rest if ln["binary"]
+                   for p in (ln["binary"], os.path.realpath(ln["binary"])) if os.path.exists(p)})
+    bin_owners = _dpkg_owners(bins)
     for ln in rest:
         binary = ln["binary"]
         kind, hint = _classify_local(ln["argv"], binary)
@@ -509,980 +408,6 @@ def attach_launchers(rows: list[dict]) -> list[dict]:
             r["size_kb"] = kb
             r["size"] = _human_kb(kb)
         r.setdefault("size_kb", 0)
-    return wine
-
-
-def _dir_kb(path: str, max_files: int = 100_000) -> int:
-    """Disk usage of a folder in KiB, like `du -s` (stops counting after max_files files)."""
-    total = n = 0
-    stack = [path]
-    while stack and n < max_files:
-        try:
-            with os.scandir(stack.pop()) as it:
-                for e in it:
-                    try:
-                        if e.is_dir(follow_symlinks=False):
-                            stack.append(e.path)
-                        else:
-                            total += e.stat(follow_symlinks=False).st_blocks * 512
-                            n += 1
-                    except OSError:
-                        pass
-        except OSError:
-            pass
-    return total // 1024
-
-
-def _date_epoch(yyyymmdd: str) -> float:
-    """'20251014' (a Windows InstallDate) -> epoch seconds, or 0.0."""
-    try:
-        return time.mktime(time.strptime(yyyymmdd.strip()[:8], "%Y%m%d"))
-    except ValueError:
-        return 0.0
-
-
-def _within(path: str, folder: str) -> bool:
-    return path == folder or path.startswith(folder.rstrip("/") + "/")
-
-
-def _local_row(rid: str, name: str, kind: str, hint: str, location: str, kb: int,
-               **extra) -> dict:
-    row = {"source": "local", "id": rid, "name": name, "version": "", "size": _human_kb(kb),
-           "size_kb": kb, "summary": "", "protected": False, "icon": "", "desktop": "",
-           "package_name": name, "kind": kind, "remove_hint": hint, "location": location,
-           "is_app": False, "includes": []}
-    row.update(extra)
-    return row
-
-
-# ── Windows programs (Wine / Bottles): the prefix registry is the real list ─────────────────────
-# Wine adds a menu entry only for Start-menu shortcuts; its "Add/Remove programs" registry keys
-# list everything installed — agents and services included.
-_BOTTLES_DIRS = (os.path.expanduser("~/.var/app/com.usebottles.bottles/data/bottles/bottles"),
-                 os.path.expanduser("~/.local/share/bottles/bottles"))
-_WINE_PROG_RE = re.compile(r"^wine(64)?(-stable|-staging|-development|-devel)?$")
-_WINE_BUNDLED_RE = re.compile(r"^Wine (Mono|Gecko)\b")  # Wine's own parts, put in every prefix
-_WIN_RUNTIME_RE = re.compile(r"^(Microsoft (Visual C\+\+|\.NET|ASP\.NET|Windows Desktop Runtime|"
-                             r"Edge WebView2|Access database engine)|DirectX\b|vcredist)",
-                             re.IGNORECASE)
-_WIN_GENERIC_DIRS = {"drive_c", "c:", "program files", "program files (x86)", "programdata",
-                     "appdata", "local", "roaming", "users", "public", "windows", "system32",
-                     "syswow64", "common files", "start menu", "programs", "microsoft",
-                     os.path.basename(os.path.expanduser("~")).lower()}
-
-
-def wine_prefixes() -> list[str]:
-    """Every Wine prefix we can find: ~/.wine, $WINEPREFIX, wineprefixes/, Bottles, PlayOnLinux."""
-    home = os.path.expanduser("~")
-    cands = [os.path.join(home, ".wine"), os.environ.get("WINEPREFIX", "")]
-    for pattern in (*(os.path.join(d, "*") for d in _BOTTLES_DIRS),
-                    os.path.join(home, ".local/share/wineprefixes/*"),
-                    os.path.join(home, ".PlayOnLinux/wineprefix/*")):
-        cands += glob.glob(pattern)
-    seen, out = set(), []
-    for p in cands:
-        p = os.path.realpath(os.path.expanduser(p)) if p else ""
-        if p and p not in seen and os.path.isfile(os.path.join(p, "system.reg")):
-            seen.add(p)
-            out.append(p)
-    return out
-
-
-def _arg_after(argv: list[str], flags: tuple[str, ...]) -> str:
-    for i, a in enumerate(argv):
-        if a in flags and i + 1 < len(argv):
-            return argv[i + 1]
-        for f in flags:
-            if f.startswith("--") and a.startswith(f + "="):
-                return a.split("=", 1)[1]
-    return ""
-
-
-def _wine_launch(ln: dict) -> dict | None:
-    """{prefix, folder, dirs} when a launcher starts a Windows program — the entries Wine writes
-    to applications/wine/Programs, or a Bottles 'add to menu' entry — else None."""
-    try:
-        raw = shlex.split(ln["entry"].get("Exec", ""))
-    except ValueError:
-        return None
-    i, env = (1 if raw and os.path.basename(raw[0]) == "env" else 0), {}
-    while i < len(raw) and re.match(r"[A-Za-z_]\w*=", raw[i]):
-        key, value = raw[i].split("=", 1)
-        env[key] = value
-        i += 1
-    argv = raw[i:]
-    if not argv:
-        return None
-    if "bottles" in " ".join(argv):
-        bottle = _arg_after(argv, ("-b", "--bottle"))
-        prefix = next((os.path.join(d, bottle) for d in _BOTTLES_DIRS
-                       if bottle and os.path.isdir(os.path.join(d, bottle))), "")
-        if not prefix:
-            return None
-        return {"prefix": os.path.realpath(prefix),
-                "folder": _arg_after(argv, ("-p", "--program")) or None, "dirs": []}
-    if not (_WINE_PROG_RE.match(os.path.basename(argv[0]))
-            and any(a.lower().endswith((".exe", ".lnk")) for a in argv[1:])):
-        return None  # not a Windows program (winecfg & co. come from the wine packages)
-    prefix = os.path.realpath(os.path.expanduser(env.get("WINEPREFIX") or "~/.wine"))
-    rel = ln["rel"].split(os.sep)
-    folder = rel[2] if len(rel) > 3 and rel[:2] == ["wine", "Programs"] else None
-    work = ln["entry"].get("Path", "")
-    return {"prefix": prefix, "folder": folder,
-            "dirs": [os.path.realpath(work)] if work and os.path.isdir(work) else []}
-
-
-def _reg_unescape(s: str) -> str:
-    def rep(m):
-        c = m.group(1)
-        if c[0] == "x" and len(c) > 1:
-            return chr(int(c[1:], 16))
-        return {"n": "\n", "r": "\r", "t": "\t", "0": "\0"}.get(c, c)
-    return re.sub(r"\\(x[0-9a-fA-F]{1,4}|.)", rep, s)
-
-
-def _reg_value(raw: str):
-    """A Wine .reg value: "string" / str(2):"string" -> str, dword:… -> int, anything else None."""
-    if raw.startswith("dword:"):
-        try:
-            return int(raw[6:14], 16)
-        except ValueError:
-            return None
-    m = re.match(r'(?:str\(\d\):)?"(.*)"\s*$', raw)
-    return _reg_unescape(m.group(1)) if m else None
-
-
-_REG_UNINSTALL_RE = re.compile(r"\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Uninstall\\\\",
-                               re.IGNORECASE)
-_REG_VALUE_RE = re.compile(r'^"((?:[^"\\]|\\.)*)"=(.*)$', re.MULTILINE)
-
-
-def read_uninstall_entries(prefix: str) -> list[dict]:
-    """The programs a Wine prefix lists under 'Add/Remove programs' — what `wine uninstaller`
-    shows, minus hidden system components, updates and Wine's own Mono/Gecko."""
-    entries = []
-    for reg in ("system.reg", "user.reg"):
-        try:
-            with open(os.path.join(prefix, reg), encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-        except OSError:
-            continue
-        # a plain search for the key path, then parse just that key ([…\\Uninstall\\<key>] <time>,
-        # its values, a blank line) — a regex over the whole multi-MB file took ~0.4 s each
-        for m in _REG_UNINSTALL_RE.finditer(text):
-            start = text.rfind("\n", 0, m.start()) + 1
-            head_end = text.find("\n", m.end())
-            head_end = len(text) if head_end < 0 else head_end
-            close = text.rfind("]", m.end(), head_end)
-            key = text[m.end():close] if close > 0 else ""
-            if text[start] != "[" or not key or "\\\\" in key:
-                continue  # not a key header, or a sub-key of an entry
-            body_end = text.find("\n\n", head_end)
-            e = {"key": _reg_unescape(key)}
-            for v in _REG_VALUE_RE.finditer(text, head_end,
-                                            len(text) if body_end < 0 else body_end):
-                e[_reg_unescape(v.group(1))] = _reg_value(v.group(2).rstrip())
-            entries.append(e)
-    out, seen = [], set()
-    for e in entries:
-        name = e.get("DisplayName")
-        if (not isinstance(name, str) or not name.strip() or e.get("SystemComponent") == 1
-                or e.get("ParentKeyName") or _WINE_BUNDLED_RE.match(name)
-                or str(e.get("ReleaseType", "")).lower() in ("update", "hotfix",
-                                                              "security update")):
-            continue
-        e["DisplayName"] = name.strip()
-        if e["DisplayName"].lower() not in seen:  # 64-bit and Wow6432Node copies
-            seen.add(e["DisplayName"].lower())
-            out.append(e)
-    return out
-
-
-def _win_path(prefix: str, winpath) -> str:
-    """C:\\Program Files\\X (optionally quoted) -> the folder inside the prefix."""
-    m = re.match(r'\s*"?([A-Za-z]):\\?([^"]*)', winpath) if isinstance(winpath, str) else None
-    if not m:
-        return ""
-    parts = [p for p in m.group(2).split("\\") if p]
-    return os.path.realpath(os.path.join(prefix, "dosdevices", m.group(1).lower() + ":", *parts))
-
-
-def _specific_dir(path: str) -> bool:
-    """False for generic Windows folders (Program Files, AppData\\Local, …) — they prove nothing."""
-    return bool(path) and os.path.basename(path.rstrip("/")).lower() not in _WIN_GENERIC_DIRS
-
-
-def _dirs_overlap(xs: list[str], ys: list[str]) -> bool:
-    for x in xs:
-        for y in ys:
-            short, long_ = (x, y) if len(x) <= len(y) else (y, x)
-            if _within(long_, short) and _specific_dir(short):
-                return True
-    return False
-
-
-_WIN_SUBDIRS = {"bin", "bin32", "bin64", "x64", "x86", "cef", "program", "app"}
-
-
-def _program_dir(path: str) -> str:
-    """…\\EaseUS Partition Master\\bin -> …\\EaseUS Partition Master (a launcher's working dir
-    is often a sub-folder of the program's own folder)."""
-    while (os.path.basename(path).lower() in _WIN_SUBDIRS
-           and _specific_dir(os.path.dirname(path))):
-        path = os.path.dirname(path)
-    return path
-
-
-def _entry_location(prefix: str, e: dict) -> tuple[str, bool]:
-    """(the program's folder, whether the entry names a folder at all): InstallLocation, else
-    the uninstaller's or icon's folder."""
-    candidates = [_win_path(prefix, e.get("InstallLocation"))]
-    for key in ("DisplayIcon", "UninstallString"):
-        v = e.get(key) if isinstance(e.get(key), str) else ""
-        exe = re.match(r'\s*"([^"]+)"|\s*([A-Za-z]:\\.*?\.exe)', v, re.IGNORECASE)
-        if exe:
-            candidates.append(os.path.dirname(_win_path(prefix, exe.group(1) or exe.group(2))))
-    candidates = [c for c in candidates if c and _specific_dir(c)]
-    return next((c for c in candidates if os.path.isdir(c)), ""), bool(candidates)
-
-
-def _guess_location(prefix: str, e: dict, taken: list[str]) -> str:
-    """MSI installs often record no folder at all: find the Program Files folder named like the
-    program (or Publisher\\Program), never one another entry already owns."""
-    want, pub = _norm_name(e["DisplayName"]), _norm_name(e.get("Publisher") or "")
-    drive = os.path.join(prefix, "drive_c")
-    roots = [os.path.join(drive, "Program Files"), os.path.join(drive, "Program Files (x86)"),
-             *glob.glob(os.path.join(drive, "users", "*", "AppData", "Local", "Programs"))]
-    best = (0, 0, "")
-    for root in roots:
-        for d1 in sorted(_listdir(root)):
-            p1 = os.path.join(root, d1)
-            for path, depth in [(p1, 1), *((os.path.join(p1, d2), 2) for d2 in _listdir(p1))]:
-                path = os.path.realpath(path)
-                if (not _specific_dir(path) or not os.path.isdir(path)
-                        or any(_within(path, t) or _within(t, path) for t in taken)):
-                    continue
-                n = _norm_name(os.path.basename(path))
-                pair = f"{_norm_name(d1)} {n}"  # ManageEngine\\Log360Cloud_Agent
-                score = (3 if want in (n, pair) else 2 if _names_match(n, want)
-                         else 1 if depth == 1 and _names_match(n, pub) else 0)
-                best = max(best, (score, depth, path))
-    return best[2] if best[0] else ""
-
-
-def _norm_name(s: str) -> str:
-    """'BLACKBOXAI version 1.0.4' / 'WPS Office (12.2.0.23196)' -> 'blackboxai' / 'wps office'."""
-    low = s.lower().replace("\xa0", " ")
-    t = re.sub(r"\(.*?\)|\bversion\b|\bv?\d[\w.\-]*", " ", low)
-    words = re.findall(r"[a-z0-9]+(?:[.'][a-z0-9]+)*", t) or re.findall(r"[a-z0-9]+", low)
-    return " ".join(words)
-
-
-def _names_match(a: str, b: str) -> bool:
-    return bool(a and b) and (a == b or a.startswith(b + " ") or b.startswith(a + " "))
-
-
-def _group_wine_launchers(lns: list[dict]) -> list[list[dict]]:
-    """One group per program: same Start-menu folder, or working folders inside each other
-    (WPS Office's PDF/Docs/Sheets/Slides entries all run from Kingsoft\\WPS Office)."""
-    parent = list(range(len(lns)))
-
-    def find(i):
-        while parent[i] != i:
-            parent[i] = parent[parent[i]]
-            i = parent[i]
-        return i
-    for i, a in enumerate(lns):
-        for j in range(i):
-            b = lns[j]["wine"]
-            if ((a["wine"]["folder"] and a["wine"]["folder"] == b["folder"])
-                    or _dirs_overlap(a["wine"]["dirs"], b["dirs"])):
-                parent[find(i)] = find(j)
-    groups: dict[int, list[dict]] = {}
-    for i, ln in enumerate(lns):
-        groups.setdefault(find(i), []).append(ln)
-    return list(groups.values())
-
-
-def windows_programs(launchers: list[dict]) -> list[dict]:
-    """Windows programs in every Wine prefix / Bottles bottle, merged with their menu entries."""
-    by_prefix: dict[str, list[dict]] = {}
-    for ln in launchers:
-        by_prefix.setdefault(ln["wine"]["prefix"], []).append(ln)
-    rows = []
-    for prefix in sorted(set(by_prefix) | set(wine_prefixes())):
-        bottle = (os.path.basename(prefix)
-                  if any(_within(prefix, os.path.realpath(d)) for d in _BOTTLES_DIRS) else "")
-        default = prefix == os.path.realpath(os.path.expanduser("~/.wine"))
-        where = (f"Bottles: {bottle}" if bottle else
-                 "Wine" if default else f"Wine prefix {os.path.basename(prefix)}")
-        uninstaller = ("wine uninstaller" if default
-                       else f"WINEPREFIX={shlex.quote(prefix)} wine uninstaller")
-        groups = []
-        for g in _group_wine_launchers(by_prefix.get(prefix, [])):
-            folders = [ln["wine"]["folder"] for ln in g if ln["wine"]["folder"]]
-            folder = max(set(folders), key=folders.count) if folders else ""
-            named = [(_localized(ln["entry"], "Name"), ln) for ln in g]
-            apps = [(n, ln) for n, ln in named if not n.lower().startswith("uninstall")] or named
-            primary = min(apps, key=lambda p: (p[0] != folder, len(p[0]), p[0]))
-            groups.append({
-                "primary": primary, "folder": folder,
-                "dirs": [d for ln in g for d in ln["wine"]["dirs"]],
-                "keys": ({_norm_name(n) for n, _ in apps}
-                         | ({_norm_name(folder)} if folder else set())),
-                "includes": [n for n, _ in apps if n != primary[0]],
-                "uninstall": next((n for n, _ in named if n.lower().startswith("uninstall")), ""),
-                "uninstall_path": next((ln["path"] for n, ln in named
-                                        if n.lower().startswith("uninstall")), ""),
-                "had_path": any(ln["entry"].get("Path") for ln in g), "entry": None})
-
-        entries = [(e, *_entry_location(prefix, e)) for e in read_uninstall_entries(prefix)]
-        taken = [loc for _, loc, _ in entries if loc]
-        for e, loc, named in entries:
-            if not loc and not named:
-                loc = _guess_location(prefix, e, taken)
-                taken += [loc] if loc else []
-            key = _norm_name(e["DisplayName"])
-            g = (next((g for g in groups if g["entry"] is None
-                       and any(_names_match(key, k) for k in g["keys"])), None)
-                 or next((g for g in groups if g["entry"] is None and loc
-                          and _dirs_overlap([loc], g["dirs"])), None))
-            if g is None:
-                g = {"primary": None, "includes": [], "uninstall": "", "dirs": [], "folder": ""}
-                groups.append(g)
-            g.update(entry=e, location=loc, named=named)
-
-        for g in groups:
-            e = g["entry"] or {}
-            runtime = bool(e) and bool(_WIN_RUNTIME_RE.match(e["DisplayName"]))
-            # the folders it occupies, outermost first and none inside another (GeForce NOW
-            # runs from GeForceNOW\ but registers its uninstaller in Installer2\)
-            dirs = []
-            for d in sorted({c for c in (g.get("location"), *map(_program_dir, g["dirs"]))
-                             if c and _specific_dir(c) and os.path.isdir(c)}, key=len):
-                if not any(_within(d, k) for k in dirs):
-                    dirs.append(d)
-            # the entry or its menu entry names a folder but nothing is there any more, or all
-            # that's left is the uninstaller (unins000.exe, "Uninstall X.exe")
-            files = [f for d in dirs for f in _listdir(d)]
-            stub = bool(files) and all(re.match(r"unins", f, re.IGNORECASE)
-                                       and os.path.isfile(os.path.join(d, f))
-                                       for d in dirs for f in _listdir(d))
-            leftover = stub or (not dirs and bool(g.get("named") or g.get("had_path")))
-            kb = sum(_dir_kb(d) for d in dirs)
-            if not kb and not leftover and isinstance(e.get("EstimatedSize"), int):
-                kb = e["EstimatedSize"]
-            if leftover:
-                hint = (("Only its uninstaller is left — the program itself is gone. "
-                         if stub else "Its program folder is gone, so this is a leftover entry. ")
-                        + "Clear it with "
-                        + (f"Bottles → {bottle} → Programs." if bottle else
-                           f"Wine's uninstaller: `{uninstaller}` (“Uninstall Wine Software”) — "
-                           "that removes its menu entries too."))
-            elif bottle:
-                hint = (f"Installed inside the Bottles bottle “{bottle}”. Remove it in Bottles "
-                        f"→ {bottle} → Programs, or delete the whole bottle.")
-            elif runtime:
-                hint = ("A runtime that Windows programs in this Wine prefix use. Leave it unless "
-                        f"you've removed those programs; then remove it with `{uninstaller}`.")
-            elif not e:
-                hint = ("Wine has no uninstall entry for it (it may be portable): delete its "
-                        "folder and its menu entries under ~/.local/share/applications/wine.")
-            elif g["uninstall"]:
-                hint = (f"Remove it with its own “{g['uninstall']}” menu entry, or with Wine's "
-                        f"uninstaller: `{uninstaller}` (“Uninstall Wine Software”).")
-            else:
-                hint = (f"Remove it with Wine's uninstaller: run `{uninstaller}` (in the menu: "
-                        "“Uninstall Wine Software”) and pick it — that removes its menu entries "
-                        "too.")
-            version = e.get("DisplayVersion") if isinstance(e.get("DisplayVersion"), str) else ""
-            name = e.get("DisplayName") or g["primary"][0]
-            if version:  # 'NVIDIA GeForce NOW 2.0.80.173' -> 'NVIDIA GeForce NOW'
-                name = re.sub(rf"[\s,(-]*(version\s*)?v?{re.escape(version)}\)?\s*$", "", name,
-                              flags=re.IGNORECASE) or name
-            kind = f"Windows {'runtime' if runtime else 'app'} ({where})"
-            date = e.get("InstallDate") if isinstance(e.get("InstallDate"), str) else ""
-            row = _local_row(f"wine:{prefix}:{e.get('key') or name}", name,
-                             kind + (" · leftover" if leftover else ""), hint,
-                             dirs[0] if dirs else prefix, kb, version=version,
-                             summary=e.get("Publisher") or "", is_app=not runtime,
-                             runtime=runtime, includes=g["includes"], prefix=prefix,
-                             bottle=bottle, leftover=leftover,
-                             uninstall_launcher=g.get("uninstall_path", ""),
-                             installed=_date_epoch(date) or (_mtime(dirs[0]) if dirs else 0.0))
-            if g["primary"]:
-                _, ln = g["primary"]
-                _apply_launcher(row, ln["path"], ln["entry"])
-                row["launcher_path"] = ln["path"]
-            row["icon"] = row["icon"] or "wine"
-            rows.append(row)
-    return rows
-
-
-# ── software no package manager tracks and no menu shows ────────────────────────────────────────
-_PRUNE_DIRS = {"node_modules", "target", "__pycache__", "site-packages", "venv", "dist", "build",
-               "snap"}
-_UNINSTALLER_RE = re.compile(r"^(uninstall|uninst)[\w.-]*?(\.sh|\.run)?$|[\w.-]*-uninstall(er)?"
-                             r"(\.sh)?$", re.IGNORECASE)
-
-
-def find_appimages() -> list[str]:
-    """AppImage files in the usual places: the home folder (3 levels, hidden dirs and build
-    trees skipped), ~/.local/bin and /opt."""
-    home = os.path.expanduser("~")
-    found = set()
-    for root, depth in ((home, 3), (os.path.join(home, ".local", "bin"), 0), ("/opt", 2)):
-        stack = [(root, 0)]
-        while stack:
-            folder, level = stack.pop()
-            try:
-                it = os.scandir(folder)
-            except OSError:
-                continue
-            with it:
-                for e in it:
-                    try:
-                        if e.is_dir(follow_symlinks=False):
-                            if (level < depth and not e.name.startswith(".")
-                                    and e.name not in _PRUNE_DIRS):
-                                stack.append((e.path, level + 1))
-                        elif e.name.lower().endswith(".appimage") and e.is_file():
-                            found.add(os.path.realpath(e.path))
-                    except OSError:
-                        pass
-    return sorted(found)
-
-
-def _appimage_name(path: str) -> str:
-    """'Nimbalyst-Linux.AppImage' / 'Foo-1.2.3-x86_64.AppImage' -> 'Nimbalyst' / 'Foo'."""
-    stem = re.sub(r"\.appimage$", "", os.path.basename(path), flags=re.IGNORECASE)
-    words = [w for w in re.split(r"[-_ ]+", stem) if w and not re.fullmatch(
-        r"v?\d[\w.]*|x86|x64|amd64|aarch64|arm64|armhf|i[36]86|linux|appimage", w, re.IGNORECASE)]
-    return " ".join(words) or stem
-
-
-def _scan_install_dir(folder: str, max_files: int = 100_000) -> tuple[int, bool, str]:
-    """(KiB on disk, has a runnable file, path of a vendor uninstaller) in one walk."""
-    total = n = 0
-    runnable, uninstaller = False, ""
-    stack = [(folder, 0)]
-    while stack and n < max_files:
-        path, level = stack.pop()
-        try:
-            it = os.scandir(path)
-        except OSError:
-            continue
-        with it:
-            for e in it:
-                try:
-                    if e.is_dir(follow_symlinks=False):
-                        stack.append((e.path, level + 1))
-                        continue
-                    st = e.stat(follow_symlinks=False)
-                    total += st.st_blocks * 512
-                    n += 1
-                    if e.is_file(follow_symlinks=False) and st.st_mode & 0o111:
-                        runnable = True
-                        if not uninstaller and level <= 4 and _UNINSTALLER_RE.match(e.name):
-                            uninstaller = e.path
-                except OSError:
-                    pass
-    return total // 1024, runnable, uninstaller
-
-
-def _listdir(path: str) -> list[str]:
-    try:
-        return os.listdir(path)
-    except OSError:
-        return []
-
-
-def _json(path: str) -> dict:
-    try:
-        with open(path, encoding="utf-8") as fh:
-            data = json.load(fh)
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
-
-
-def vendor_paths() -> tuple[list[str], list[str], dict[str, list[str]]]:
-    """(/opt/* folders, /usr/local/{bin,sbin}/* files, which of those dpkg owns)."""
-    opt = [d for d in sorted(glob.glob("/opt/*")) if os.path.isdir(d) and not os.path.islink(d)]
-    local_bins = sorted(glob.glob("/usr/local/bin/*") + glob.glob("/usr/local/sbin/*"))
-    # exact paths only (the folder and its direct children): a glob makes dpkg match every file
-    # of every package, which took ~4 s here
-    children = [os.path.join(d, c) for d in opt for c in sorted(_listdir(d))]
-    return opt, local_bins, _dpkg_owners(opt + children + local_bins)
-
-
-def list_unpackaged(rows: list[dict], vendor=None) -> list[dict]:
-    """Software installed without a package manager and without a menu entry: AppImages, vendor
-    installs in /opt and /usr/local, tools in ~/.local/bin, and what pipx, npm -g, cargo and
-    rustup installed. All read-only, each with a removal hint. `vendor` is vendor_paths()."""
-    home = os.path.expanduser("~")
-    covered = {os.path.realpath(r["location"]) for r in rows
-               if r["source"] == "local" and r.get("location")}
-    out = []
-
-    # AppImages without a menu entry (a hidden URL-handler launcher can still name them)
-    names, launchers = {}, {}
-    for ln in scan_launchers(include_hidden=True):
-        for a in _exec_argv(ln["entry"]):
-            if a.lower().endswith(".appimage"):
-                names.setdefault(os.path.realpath(a), ln["entry"])
-                launchers.setdefault(os.path.realpath(a), []).append(ln["path"])
-    for path in find_appimages():
-        if path in covered:
-            continue
-        entry = names.get(path, {})
-        row = _local_row(f"appimage:{path}", _localized(entry, "Name") or _appimage_name(path),
-                         "AppImage", "A self-contained AppImage file: delete the file to remove "
-                         "it." + (" Its hidden launcher in ~/.local/share/applications can go "
-                                  "too." if entry else ""),
-                         path, os.path.getsize(path) // 1024, is_app=True,
-                         icon=entry.get("Icon", ""), launchers=launchers.get(path, []))
-        out.append(row)
-        covered.add(path)
-
-    # vendor installs: /opt/<name> and /usr/local/{bin,sbin} files dpkg doesn't own
-    opt, local_bins, owners = vendor or vendor_paths()
-    for d in opt:
-        if (d in owners or any(_within(p, d) for p in owners)
-                or any(_within(c, d) for c in covered)):
-            continue
-        if not os.access(d, os.R_OK | os.X_OK):
-            continue  # root-only folders here are service state (containerd's), not programs
-        kb, runnable, uninstaller = _scan_install_dir(d)
-        if not runnable:
-            out.append(_local_row(f"opt:{d}", os.path.basename(d), "Leftover folder",
-                                  "Nothing runnable is left in it — usually what remains after "
-                                  "an uninstall. Delete the folder (as root) if you don't need it.",
-                                  d, kb))
-            continue
-        hint = (f"Its vendor's uninstaller: {uninstaller}" if uninstaller else
-                "Use the vendor's uninstall instructions; otherwise stop its service and delete "
-                "the folder as root.")
-        out.append(_local_row(f"opt:{d}", os.path.basename(d), "Manual install (/opt)", hint,
-                              d, kb))
-        covered.add(d)
-    for p in local_bins:
-        real = os.path.realpath(p)
-        if (p in owners or real in owners or not os.path.isfile(real)
-                or not os.access(real, os.X_OK) or "/node_modules/" in real
-                or any(_within(real, c) for c in covered)):
-            continue  # npm -g links (below) and /opt programs are listed with their package
-        name = os.path.basename(p)
-        lib = os.path.join("/usr/local/lib", name)
-        kb = os.path.getsize(real) // 1024 + (_dir_kb(lib) if os.path.isdir(lib) else 0)
-        out.append(_local_row(f"usr-local:{p}", name, "Manual install (/usr/local)",
-                              "Installed by hand or by a vendor's install script. Follow the "
-                              "vendor's uninstall steps — usually: stop its service, then delete "
-                              f"{p}" + (f" and {lib}" if os.path.isdir(lib) else "") + ".",
-                              p, kb))
-
-    # pipx apps
-    pipx_home = os.environ.get("PIPX_HOME") or next(
-        (p for p in (os.path.join(home, ".local/share/pipx"), os.path.join(home, ".local/pipx"))
-         if os.path.isdir(p)), "")
-    pipx_venvs = os.path.join(pipx_home, "venvs") if pipx_home else ""
-    for venv in sorted(glob.glob(os.path.join(pipx_venvs, "*"))) if pipx_venvs else []:
-        name = os.path.basename(venv)
-        meta = _json(os.path.join(venv, "pipx_metadata.json")).get("main_package") or {}
-        out.append(_local_row(f"pipx:{name}", name, "Python app (pipx)",
-                              f"Remove it with: pipx uninstall {name}", venv, _dir_kb(venv),
-                              version=meta.get("package_version") or ""))
-
-    # npm -g packages (the npm and corepack that come with Node.js aren't separate installs)
-    npm_roots = ["/usr/local/lib/node_modules", os.path.join(home, ".npm-global/lib/node_modules"),
-                 *sorted(glob.glob(os.path.join(home, ".nvm/versions/node/*/lib/node_modules")))]
-    if os.environ.get("NPM_CONFIG_PREFIX"):
-        npm_roots.append(os.path.join(os.environ["NPM_CONFIG_PREFIX"], "lib/node_modules"))
-    for root in dict.fromkeys(npm_roots):
-        pkgs = [p for p in glob.glob(os.path.join(root, "*")) if not os.path.basename(p)
-                .startswith("@")] + glob.glob(os.path.join(root, "@*", "*"))
-        node = re.search(r"/node/(v[\d.]+)/", root)
-        for p in sorted(pkgs):
-            name = os.path.relpath(p, root)
-            if name in ("npm", "corepack") or not os.path.isdir(p):
-                continue
-            sudo = "" if _within(root, home) else "sudo "
-            version = _json(os.path.join(p, "package.json")).get("version", "")
-            out.append(_local_row(f"npm:{p}", name, "Node.js package (npm -g"
-                                  + (f", Node {node.group(1)})" if node else ")"),
-                                  f"Remove it with: {sudo}npm uninstall -g {name}", p, _dir_kb(p),
-                                  version=version if isinstance(version, str) else "",
-                                  npm_root=root))
-
-    # cargo install / rustup toolchains
-    cargo_home = os.environ.get("CARGO_HOME") or os.path.join(home, ".cargo")
-    installs = _json(os.path.join(cargo_home, ".crates2.json")).get("installs") or {}
-    for spec, info in sorted(installs.items()):
-        name, _, rest = spec.partition(" ")
-        bins = [os.path.join(cargo_home, "bin", b) for b in (info or {}).get("bins", [])]
-        bins = [b for b in bins if os.path.isfile(b)]
-        out.append(_local_row(f"cargo:{name}", name, "Rust program (cargo install)",
-                              f"Remove it with: cargo uninstall {name}",
-                              bins[0] if bins else os.path.join(cargo_home, "bin"),
-                              sum(os.path.getsize(b) for b in bins) // 1024,
-                              version=rest.split(" ")[0], tool_home=cargo_home,
-                              includes=[os.path.basename(b) for b in bins
-                                        if os.path.basename(b) != name]))
-    rustup_home = os.environ.get("RUSTUP_HOME") or os.path.join(home, ".rustup")
-    try:
-        with open(os.path.join(rustup_home, "settings.toml"), encoding="utf-8") as fh:
-            default_tc = re.search(r'^default_toolchain\s*=\s*"([^"]+)"', fh.read(), re.MULTILINE)
-    except OSError:
-        default_tc = None
-    for tc in sorted(glob.glob(os.path.join(rustup_home, "toolchains", "*"))):
-        name = os.path.basename(tc)
-        out.append(_local_row(f"rustup:{name}", name, "Rust toolchain (rustup)",
-                              f"Remove it with: rustup toolchain uninstall {name}", tc,
-                              _dir_kb(tc), tool_home=cargo_home,
-                              default=bool(default_tc) and default_tc.group(1) == name))
-
-    # programs in ~/.local/bin, ~/bin and ~/go/bin (several names for one file = one row)
-    skip = [p for p in (pipx_venvs, cargo_home, rustup_home) if p] + npm_roots
-    tools: dict[str, list[str]] = {}
-    for d in (os.path.join(home, ".local/bin"), os.path.join(home, "bin"),
-              os.path.join(home, "go/bin")):
-        for p in sorted(glob.glob(os.path.join(d, "*"))):
-            real = os.path.realpath(p)
-            if (os.path.isfile(real) and os.access(real, os.X_OK)
-                    and not real.lower().endswith(".appimage")
-                    and not any(_within(real, s) for s in skip)
-                    and not any(_within(real, c) for c in covered)):
-                tools.setdefault(real, []).append(p)
-    for real, links in tools.items():
-        base = os.path.basename(real)
-        names_ = [os.path.basename(p) for p in links]
-        name = min(names_, key=lambda n: (not base.startswith(n), n != base, n))
-        shown = real.replace(home, "~", 1)
-        out.append(_local_row(f"bin:{real}", name, "Command-line tool (your home folder)",
-                              f"Lives in your home folder ({shown}). Check the tool's own docs "
-                              "for an uninstall command; otherwise delete it and its links.",
-                              real, os.path.getsize(real) // 1024, links=links,
-                              includes=[n for n in names_ if n != name]))
-    return out
-
-
-def list_flatpak_runtimes() -> list[dict]:
-    """Flatpak runtimes & extensions: not apps, but they're installed and take real space."""
-    if not shutil.which("flatpak"):
-        return []
-    cols = "application,name,version,branch,size,installation,ref"
-    _, out, _ = _run(["flatpak", "list", "--runtime", f"--columns={cols}"])
-    rows = []
-    for line in out.splitlines():
-        f = line.split("\t")
-        if len(f) < 7 or not f[6]:
-            continue
-        rows.append({"source": "flatpak", "id": f[6], "name": f[1] or f[0],
-                     "version": f[2] or f[3], "size": f[4] or "-", "installation": f[5],
-                     "summary": "Flatpak runtime", "protected": True, "runtime": True})
-    return rows
-
-
-# ── what can be done about software no package manager owns ─────────────────────────────────────
-def _home_file(path: str) -> bool:
-    """A file or link inside the home folder: the only kind of thing the Trash action touches."""
-    if not path or not (os.path.isfile(path) or os.path.islink(path)):
-        return False
-    home = os.path.realpath(os.path.expanduser("~"))
-    parent = os.path.realpath(os.path.dirname(os.path.abspath(path)))
-    return _within(parent, home)
-
-
-def _command_action(name: str, argv: list[str], bin_dir: str = "", note: str = "") -> dict:
-    shown = " ".join(shlex.quote(a) for a in argv)
-    return {"type": "command", "label": "Uninstall", "argv": argv,
-            "env": {"PATH": bin_dir + os.pathsep + os.environ.get("PATH", "")} if bin_dir else {},
-            "title": f"Uninstall {name}?",
-            "text": f"This runs its own uninstall command as you (no password needed):\n\n"
-                    f"{shown}{note}"}
-
-
-def local_action(r: dict) -> dict | None:
-    """What the app can do about an item no package manager owns, or None (then it only says how
-    to remove it). Trash is reversible; commands are each tool's own uninstaller, run as you."""
-    kind, name = r.get("kind", ""), r["name"]
-    if name.startswith("-"):
-        return None  # never pass something that looks like an option to a tool
-    home = os.path.expanduser("~")
-    loc = r.get("location", "")
-    if kind == "AppImage":
-        files = [f for f in dict.fromkeys((loc, r.get("launcher_path", ""),
-                                           *r.get("launchers", []))) if _home_file(f)]
-        if _home_file(loc):
-            return {"type": "trash", "label": "Move to Trash", "paths": files,
-                    "title": f"Move {name} to the Trash?",
-                    "text": "The AppImage file" + (" and its launcher" if len(files) > 1 else "")
-                            + " go to the Trash, so you can restore them from there."}
-        return None
-    if kind == "Launcher only" and _home_file(r.get("launcher_path", "")):
-        return {"type": "trash", "label": "Move to Trash", "paths": [r["launcher_path"]],
-                "title": f"Remove the leftover launcher “{name}”?",
-                "text": "Its program is already gone. The launcher goes to the Trash, so you can "
-                        "restore it from there."}
-    if kind == "Your own script or program" and _home_file(r.get("launcher_path", "")):
-        return {"type": "trash", "label": "Remove from menu", "paths": [r["launcher_path"]],
-                "title": f"Remove {name} from the menu?",
-                "text": "Only its launcher goes to the Trash. The program itself "
-                        f"({loc.replace(home, '~', 1)}) stays where it is."}
-    if kind.startswith("Windows"):
-        if r.get("bottle"):
-            flatpak_bottles = _within(r.get("prefix", ""), os.path.realpath(_BOTTLES_DIRS[0]))
-            argv = (["flatpak", "run", "com.usebottles.bottles"] if flatpak_bottles
-                    else ["bottles"])
-            return ({"type": "run", "label": "Open Bottles", "argv": argv}
-                    if shutil.which(argv[0]) else None)
-        if r.get("uninstall_launcher") and not r.get("leftover"):
-            return {"type": "launch", "label": "Run its uninstaller",
-                    "desktop": r["uninstall_launcher"]}
-        wine = shutil.which("wine") or shutil.which("wine-stable") or shutil.which("wine64")
-        if wine and r.get("prefix"):
-            return {"type": "run", "label": "Open Wine uninstaller", "argv": [wine, "uninstaller"],
-                    "env": {"WINEPREFIX": r["prefix"]}}
-        return None
-    if kind == "Python app (pipx)" and shutil.which("pipx"):
-        return _command_action(name, ["pipx", "uninstall", name])
-    if kind.startswith("Node.js package") and _within(r.get("npm_root", ""), home):
-        prefix = os.path.dirname(os.path.dirname(r["npm_root"]))  # …/lib/node_modules
-        npm = os.path.join(prefix, "bin", "npm")
-        if os.access(npm, os.X_OK):  # nvm's npm needs its own node first on PATH
-            return _command_action(name, [npm, "uninstall", "-g", name],
-                                   os.path.join(prefix, "bin"))
-        return None
-    if kind == "Rust program (cargo install)":
-        cargo = os.path.join(r.get("tool_home", ""), "bin", "cargo")
-        if os.access(cargo, os.X_OK):
-            return _command_action(name, [cargo, "uninstall", name], os.path.dirname(cargo))
-        return None
-    if kind == "Rust toolchain (rustup)":
-        rustup = os.path.join(r.get("tool_home", ""), "bin", "rustup")
-        if os.access(rustup, os.X_OK):
-            note = ("\n\nIt's your default toolchain: cargo and rustc stop working until you "
-                    "install another one." if r.get("default") else "")
-            return _command_action(name, [rustup, "toolchain", "uninstall", name],
-                                   os.path.dirname(rustup), note)
-        return None
-    if kind == "Command-line tool (your home folder)":
-        links = r.get("links", [])
-        if len(links) == 1 and not os.path.islink(links[0]) and _home_file(links[0]):
-            return {"type": "trash", "label": "Move to Trash", "paths": links,
-                    "title": f"Move {name} to the Trash?",
-                    "text": f"{links[0].replace(home, '~', 1)} goes to the Trash, so you can "
-                            "restore it from there."}
-    return None
-
-
-def trash_paths(paths: list[str]) -> tuple[bool, str]:
-    """Move files in the home folder to the Trash (reversible). Refuses anything else."""
-    bad = [p for p in paths if not _home_file(p)]
-    if not paths or bad:
-        return False, ("Refused: only files inside your home folder can be moved to the Trash "
-                       "here." + (f" Not allowed: {', '.join(bad)}" if bad else ""))
-    if not shutil.which("gio"):
-        return False, "The `gio` tool isn't installed, so the Trash can't be used."
-    rc, out, err = _run(["gio", "trash", "--", *paths])
-    return rc == 0, (err or out).strip()
-
-
-def _trash_date(uri: str) -> str:
-    _, out, _ = _run(["gio", "info", "-a", "trash::deletion-date", uri])
-    m = re.search(r"trash::deletion-date:\s*(\S+)", out)
-    return m.group(1) if m else ""  # ISO 8601, so it sorts as text
-
-
-def restore_from_trash(paths: list[str]) -> tuple[bool, str]:
-    """Undo trash_paths(): put the newest trashed copy of each path back where it was."""
-    rc, out, err = _run(["gio", "trash", "--list"])
-    if rc != 0:
-        return False, (err or out).strip()
-    found: dict[str, list[str]] = {}
-    for line in out.splitlines():  # "trash:///name\t/original/path"
-        uri, _, orig = line.partition("\t")
-        if orig in paths:
-            found.setdefault(orig, []).append(uri)
-    missing = [p for p in paths if p not in found]
-    for uris in found.values():  # an older copy of the same file may be in the Trash too
-        uri = uris[0] if len(uris) == 1 else max(uris, key=_trash_date)
-        rc, out, err = _run(["gio", "trash", "--restore", uri])
-        if rc != 0:
-            return False, (err or out).strip()
-    return not missing, ("" if not missing else "Not found in the Trash: " + ", ".join(missing))
-
-
-def _installed_time(r: dict) -> float:
-    """When it was installed (or last updated), from the files each installer leaves behind."""
-    if r.get("installed"):
-        return r["installed"]
-    if r["source"] == "flatpak":
-        base = (os.path.expanduser("~/.local/share/flatpak") if r.get("installation") == "user"
-                else "/var/lib/flatpak")
-        if r.get("runtime"):
-            name, arch, branch = (r["id"].split("/") + ["", "", ""])[:3]
-            return _mtime(os.path.join(base, "runtime", name, arch, branch, "active"))
-        return _mtime(os.path.join(base, "app", r["id"], "current", "active"))
-    if r["source"] == "snap":
-        return max((_mtime(p) for p in glob.glob(f"/var/lib/snapd/snaps/{r['id']}_*.snap")),
-                   default=0.0)
-    if r["source"] == "local":  # a launcher is written once, at install; programs get edited
-        return _mtime(r.get("launcher_path") or "") or _mtime(r.get("location") or "")
-    return 0.0
-
-
-# ── clean-up: space nothing needs any more (previewed exactly; nothing changes here) ────────────
-_APT_ARCHIVES = "/var/cache/apt/archives"
-
-
-def _apt_sim(args: list[str], op: str = "Remv") -> list[str]:
-    """Packages `apt-get -s <args>` would remove ('Remv') or purge ('Purg'). Changes nothing."""
-    _, out, _ = _run(["apt-get", "-s", *args], timeout=300)
-    return [ln.split()[1] for ln in out.splitlines()
-            if ln.startswith(op + " ") and len(ln.split()) > 1]
-
-
-def _pkg_sizes(pkgs: list[str]) -> dict[str, int]:
-    if not pkgs:
-        return {}
-    _, out, _ = _run(["dpkg-query", "-W", "-f", "${binary:Package}\t${Installed-Size}\n", *pkgs])
-    sizes = {}
-    for line in out.splitlines():
-        name, _, kb = line.partition("\t")
-        sizes[name] = int(kb) if kb.isdigit() else 0
-        sizes.setdefault(name.split(":")[0], sizes[name])
-    return sizes
-
-
-def _flatpak_unused(installation: str) -> list[str]:
-    """Refs `flatpak uninstall --unused` would remove, by answering "n" to its own question —
-    flatpak has no dry-run flag, and this way its own rules (pins, extensions) decide."""
-    if not shutil.which("flatpak"):
-        return []
-    try:
-        p = subprocess.run(["flatpak", "uninstall", f"--{installation}", "--unused"],
-                           input="n\n", capture_output=True, text=True, timeout=120, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return []
-    # the table it shows before asking: " 1.     org.gnome.Platform     45     r"
-    return [f"{m.group(1)}//{m.group(2)}" for m in
-            re.finditer(r"^\s*\d+\.\s+([\w.-]+\.[\w.-]+)\s+(\S+)(?:\s+\S+)*\s*$",
-                        p.stdout, re.MULTILINE)]
-
-
-def cleanup_report(rows: list[dict] | None = None) -> list[dict]:
-    """What can be cleaned up, each with exactly what would go. Nothing is changed here."""
-    cats = []
-    orphans = _apt_sim(["autoremove"])
-    sizes = _pkg_sizes(orphans)
-    cats.append({"key": "orphans", "title": "Unused packages",
-                 "summary": "Installed only because something needed them, and nothing does "
-                            "any more — usually left behind by uninstalls.",
-                 "items": [{"name": p, "kb": sizes.get(p, 0)} for p in orphans],
-                 "blocked": [p for p in orphans if is_protected(p.split(":")[0])],
-                 "action": "Remove", "argv": ["pkexec", "apt-get", "remove", "-y", *orphans]})
-
-    running = os.uname().release.replace("-generic", "")
-    _, out, _ = _run(["dpkg-query", "-W", "-f", "${db:Status-Abbrev}\t${binary:Package}\n"])
-    configs = [ln.split("\t")[1] for ln in out.splitlines()
-               if ln.startswith("rc") and running not in ln]  # never the running kernel's
-    items = []
-    for pkg in configs:  # a removed kernel's modules package leaves /lib/modules/<version> behind
-        m = re.match(r"linux-modules-(\d[\w.-]*)$", pkg.split(":")[0])
-        mods = f"/lib/modules/{m.group(1)}" if m else ""
-        items.append({"name": pkg, "kb": _dir_kb(mods) if mods and os.path.isdir(mods) else 0})
-    cats.append({"key": "configs", "title": "Leftover settings",
-                 "summary": "System-wide settings that uninstalled packages left behind "
-                            "(old kernels keep a folder of module files too).",
-                 "items": items, "blocked": [], "action": "Delete",
-                 "argv": ["pkexec", "apt-get", "purge", "-y", *configs]})
-
-    debs = sorted(glob.glob(os.path.join(_APT_ARCHIVES, "*.deb")) +
-                  glob.glob(os.path.join(_APT_ARCHIVES, "partial", "*")))
-    cats.append({"key": "apt-cache", "title": "Downloaded package files",
-                 "summary": "Copies of .deb files APT kept after installing them. Safe to delete — "
-                            "APT downloads them again if it ever needs them.",
-                 "items": [{"name": os.path.basename(d), "kb": os.path.getsize(d) // 1024}
-                           for d in debs if os.path.isfile(d)],
-                 "blocked": [], "action": "Delete", "argv": ["pkexec", "apt-get", "clean"]})
-
-    for inst, argv in (("system", ["pkexec", "flatpak", "uninstall", "--system", "--unused",
-                                   "-y", "--noninteractive"]),
-                       ("user", ["flatpak", "uninstall", "--user", "--unused", "-y",
-                                 "--noninteractive"])):
-        refs = _flatpak_unused(inst)
-        cats.append({"key": f"flatpak-{inst}",
-                     "title": "Unused Flatpak runtimes" + (" (yours)" if inst == "user" else ""),
-                     "summary": "Runtimes no installed Flatpak app uses any more.",
-                     "items": [{"name": r, "kb": 0} for r in refs], "blocked": [],
-                     "action": "Remove", "argv": argv})
-
-    leftovers = [r for r in rows or [] if r["source"] == "local" and (
-        r.get("leftover") or r.get("kind") in ("Leftover folder", "Launcher only"))]
-    cats.append({"key": "leftovers", "title": "Leftovers from removed apps",
-                 "summary": "Menu entries, registry entries and folders whose program is gone. "
-                            "Pick one to see how to clear it.",
-                 "items": [{"name": r["name"], "kb": r.get("size_kb", 0), "kind": r["kind"],
-                            "ref": [r["source"], r["id"]]} for r in leftovers],
-                 "blocked": [], "action": "", "argv": []})
-    for c in cats:
-        c["kb"] = sum(i["kb"] for i in c["items"])
-    return cats
-
-
-def verify_cleanup(cat: dict) -> str:
-    """Re-check right before running that the action still does exactly what was shown.
-    Returns '' when it does, else why not."""
-    names = [i["name"] for i in cat["items"]]
-    if cat["key"] in ("orphans", "configs"):
-        op = "Remv" if cat["key"] == "orphans" else "Purg"
-        args = ["remove", *names] if cat["key"] == "orphans" else ["purge", *names]
-        now = set(_apt_sim(args, op))
-        if now != set(names):
-            extra = sorted(now - set(names))
-            return ("Something changed since the list was made" +
-                    (f" — it would now also remove: {', '.join(extra[:8])}" if extra else "") +
-                    ". Rescan and look again.")
-        if any(is_protected(p.split(":")[0]) for p in now) and cat["key"] == "orphans":
-            return "It would remove an essential system package."
-    elif cat["key"].startswith("flatpak-"):
-        if set(_flatpak_unused(cat["key"].split("-", 1)[1])) != set(names):
-            return "The set of unused runtimes changed. Rescan and look again."
-    return ""
-
-
-# ── scan cache: show the last scan instantly, then refresh it in the background ─────────────────
-_CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"),
-                          "app-manager")
-_SCAN_CACHE = os.path.join(_CACHE_DIR, "scan.json")
-_SCAN_CACHE_VERSION = 1
-
-
-def save_scan(rows: list[dict]) -> None:
-    try:
-        os.makedirs(_CACHE_DIR, mode=0o700, exist_ok=True)
-        tmp = _SCAN_CACHE + ".tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            json.dump({"version": _SCAN_CACHE_VERSION, "time": time.time(),
-                       "rows": [{k: v for k, v in r.items() if not k.startswith("_")}
-                                for r in rows]}, fh)
-        os.replace(tmp, _SCAN_CACHE)
-    except OSError:
-        pass  # a cache is a convenience; never fail a scan over it
-
-
-def load_scan() -> tuple[list[dict], float] | None:
-    try:
-        with open(_SCAN_CACHE, encoding="utf-8") as fh:
-            data = json.load(fh)
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict) or data.get("version") != _SCAN_CACHE_VERSION:
-        return None
-    rows = data.get("rows")
-    return (rows, float(data.get("time", 0))) if isinstance(rows, list) else None
 
 
 def apt_installed_kb(pkgs: list[str]) -> int:
@@ -1543,69 +468,25 @@ def _autostart_enabled(path: str) -> bool:
     return val != "false"
 
 
-def _autostart_dirs() -> list[str]:
-    """System autostart folders, highest precedence first ($XDG_CONFIG_DIRS, e.g. Zorin's
-    /etc/xdg/xdg-zorin before /etc/xdg)."""
-    dirs = [os.path.join(d, "autostart")
-            for d in (os.environ.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(":") if d]
-    return list(dict.fromkeys(dirs))
-
-
-def _autostart_skip_reason(entry: dict) -> str:
-    """'' when the login session would start this entry, else why it won't."""
-    desktops = [d for d in os.environ.get("XDG_CURRENT_DESKTOP", "GNOME").split(":") if d]
-    low = {d.lower() for d in desktops}
-    here = next((d for d in desktops if d.lower() == "gnome"), desktops[-1] if desktops
-                else "this desktop")
-    only = {d.lower() for d in entry.get("OnlyShowIn", "").split(";") if d}
-    never = {d.lower() for d in entry.get("NotShowIn", "").split(";") if d}
-    if (only and not only & low) or never & low:
-        return f"Not used on {here}"
-    if entry.get("TryExec") and not shutil.which(entry["TryExec"]):
-        return "Its program isn't installed"
-    cond = entry.get("AutostartCondition", "").split()
-    if len(cond) == 3 and cond[0] == "GSettings":
-        _, out, _ = _run(["gsettings", "get", cond[1], cond[2]], timeout=10)
-        if out.strip() == "false":
-            return "Only starts when a setting is on"
-    elif len(cond) == 2 and cond[0] in ("if-exists", "unless-exists"):
-        cfg = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
-        exists = os.path.exists(os.path.join(cfg, cond[1]))
-        if exists != (cond[0] == "if-exists"):
-            return "Its start condition isn't met"
-    return ""
-
-
 def list_autostart() -> list[dict]:
-    """Everything set to run at login. A file in ~/.config/autostart with the same name as a
-    system entry is *your setting for that entry*, not a separate app — it's listed as the system
-    entry, and deleting it is never offered (that would silently turn the entry back on)."""
-    system: dict[str, str] = {}
-    for d in _autostart_dirs():
-        for path in sorted(glob.glob(os.path.join(d, "*.desktop"))):
-            system.setdefault(os.path.basename(path), path)
-    user = {os.path.basename(p): p
-            for p in sorted(glob.glob(os.path.join(_USER_AUTOSTART, "*.desktop")))}
-    items = []
-    for base in sorted(set(system) | set(user)):
-        sys_path, own = system.get(base, ""), user.get(base, "")
-        path = own or sys_path
+    items, seen = [], set()
+    for path in sorted(glob.glob(os.path.join(_USER_AUTOSTART, "*.desktop"))):
+        base = os.path.basename(path)
+        seen.add(base)
         entry = read_desktop(path)
-        base_entry = read_desktop(sys_path) if sys_path else entry
-        phase = base_entry.get("X-GNOME-Autostart-Phase", "")
-        enabled = _autostart_enabled(path)
-        items.append({
-            "name": _localized(entry, "Name") or base, "path": path, "system_path": sys_path,
-            "comment": _localized(entry, "Comment"), "icon": entry.get("Icon", ""),
-            "command": entry.get("Exec", ""),
-            "kind": "system" if sys_path else "user",
-            "enabled": enabled,
-            "changed": bool(sys_path and own) and enabled != _autostart_enabled(sys_path),
-            "skip": _autostart_skip_reason(entry),
-            # GNOME's own Startup Applications hides these; so do we, unless asked
-            "background": bool(sys_path) and base_entry.get("NoDisplay", "").lower() == "true",
-            # started in an early session phase: the desktop itself needs it
-            "essential": bool(sys_path) and phase not in ("", "Application")})
+        items.append({"name": _localized(entry, "Name") or base, "path": path,
+                      "comment": _localized(entry, "Comment"), "icon": entry.get("Icon", ""),
+                      "kind": "user", "enabled": _autostart_enabled(path)})
+    for path in sorted(glob.glob(os.path.join(_SYS_AUTOSTART, "*.desktop"))):
+        base = os.path.basename(path)
+        if base in seen:  # a user override already shown above wins
+            continue
+        override = os.path.join(_USER_AUTOSTART, base)
+        enabled = _autostart_enabled(override) if os.path.exists(override) else True
+        entry = read_desktop(path)
+        items.append({"name": _localized(entry, "Name") or base, "path": path,
+                      "comment": _localized(entry, "Comment"), "icon": entry.get("Icon", ""),
+                      "kind": "system", "enabled": enabled})
     items.sort(key=lambda i: i["name"].lower())
     return items
 
@@ -1635,12 +516,15 @@ def set_autostart_enabled(item: dict, enabled: bool) -> None:
         fh.write("\n".join(lines) + "\n")
 
 
-def remove_autostart(item: dict) -> tuple[bool, str]:
-    """Delete a startup entry *you* added: it goes to the Trash, so it can be restored. System
-    entries are only ever switched off (set_autostart_enabled), never deleted."""
-    if item["kind"] != "user" or item.get("system_path"):
-        return False, "System entries can only be switched off, not deleted."
-    return trash_paths([item["path"]])
+def remove_autostart(item: dict) -> None:
+    """Remove a USER autostart entry (deletes the file). System entries are disabled, not deleted."""
+    if item["kind"] == "user":
+        try:
+            os.remove(item["path"])
+        except OSError:
+            pass
+    else:
+        set_autostart_enabled(item, False)
 
 
 # ── system monitor (read-only: /proc and /sys only — no root, no extra packages) ────────────────
@@ -2069,39 +953,6 @@ def _cli(argv: list[str]) -> int:
             return 3
         print("\nOK: no essential packages in the removal set.")
         return 0
-    if "--startup" in argv:
-        items = list_autostart()
-        if "--json" in argv:
-            print(json.dumps(items, indent=2))
-            return 0
-        for i in items:
-            state = "on " if i["enabled"] and not i["skip"] else "off"
-            tags = ", ".join(t for t in (
-                "added by you" if i["kind"] == "user" else
-                "changed by you" if i["changed"] else "system",
-                "background" if i["background"] else "",
-                "part of the desktop" if i["essential"] else "", i["skip"]) if t)
-            print(f"{state}  {i['name']}  [{tags}]")
-        print(f"\n{sum(1 for i in items if i['enabled'] and not i['skip'])} of {len(items)} "
-              "start when you log in")
-        return 0
-    if "--cleanup" in argv:
-        cats = cleanup_report(list_all())
-        if "--json" in argv:
-            print(json.dumps(cats, indent=2))
-            return 0
-        for c in cats:
-            n = len(c["items"])
-            size = f"  {_human_kb(c['kb'])}" if c["kb"] else ""
-            print(f"{c['title']}: {n} item{'s' if n != 1 else ''}{size}"
-                  + (f"  BLOCKED by {', '.join(c['blocked'])}" if c["blocked"] else ""))
-            for it in c["items"][:12]:
-                print(f"    {it['name']}" + (f"  {_human_kb(it['kb'])}" if it["kb"] else ""))
-            if n > 12:
-                print(f"    … and {n - 12} more")
-        free = sum(c["kb"] for c in cats if c["argv"] and c["items"] and not c["blocked"])
-        print(f"\nAbout {_human_kb(free)} can be freed. (Nothing was changed.)")
-        return 0
     rows = list_all()
     if "--apps" in argv:
         rows = [r for r in rows if r.get("is_app")]
@@ -2111,8 +962,7 @@ def _cli(argv: list[str]) -> int:
         print(f"{'SOURCE':7} {'SIZE':>9}  NAME")
         for r in rows:
             flag = " *protected" if r["protected"] else ""
-            kind = f"  [{r['kind']}]" if r["source"] == "local" else ""
-            print(f"{r['source']:7} {r['size']:>9}  {r['name']}{kind}{flag}")
+            print(f"{r['source']:7} {r['size']:>9}  {r['name']}{flag}")
         n = collections.Counter(r["source"] for r in rows)
         print(f"\n{len(rows)} program(s): {n['apt']} apt, {n['snap']} snap, "
               f"{n['flatpak']} flatpak, {n['local']} other (no package manager)")
@@ -2125,8 +975,7 @@ _SOURCE_LABEL = {"apt": "APT", "snap": "Snap", "flatpak": "Flatpak", "local": "O
 # sidebar: (key, title, symbolic icon, section, page description)
 _VIEWS = [
     ("apps", "Applications", "view-app-grid-symbolic", "Library",
-     "Every app on this computer, from every source — including Windows programs (Wine, "
-     "Bottles) and AppImages."),
+     "Everything with a launcher on this computer, from every source."),
     ("apt", "Debian packages", "package-x-generic-symbolic", "Sources",
      "Apps installed from .deb packages with APT."),
     ("flatpak", "Flatpak", "application-x-addon-symbolic", "Sources",
@@ -2134,14 +983,9 @@ _VIEWS = [
     ("snap", "Snap", "applications-utilities-symbolic", "Sources",
      "Apps installed with Snap."),
     ("local", "Unmanaged", "web-browser-symbolic", "Sources",
-     "Software no system package manager tracks — web apps, Windows programs, AppImages, "
-     "vendor installs and command-line tools. Each one says how it's removed, and offers it "
-     "where that's safe."),
+     "Apps no package manager tracks — web apps, AppImages, manual installs. Shown read-only."),
     ("all", "All packages", "view-list-symbolic", "Advanced",
-     "Everything installed, including libraries, runtimes and command-line tools."),
-    ("cleanup", "Clean up", "edit-clear-all-symbolic", "System",
-     "Things nothing needs any more — left behind by uninstalls, or downloaded and kept. Every "
-     "button shows exactly what it removes before anything happens."),
+     "Every installed package, including libraries and command-line tools."),
     ("startup", "Startup apps", "system-run-symbolic", "System",
      "Choose what starts when you log in. Turning something off is safe and reversible — "
      "system entries are only disabled for your account, never deleted."),
@@ -2150,14 +994,6 @@ _VIEWS = [
      "refreshed every 2 seconds while this page is open. Read-only: nothing here needs your "
      "password."),
 ]
-
-_PAGES = ("cleanup", "startup", "monitor")  # sidebar entries with a page of their own
-_CLEAN_ICONS = {"orphans": "package-x-generic-symbolic", "configs": "document-properties-symbolic",
-                "apt-cache": "folder-download-symbolic",
-                "flatpak-system": "application-x-addon-symbolic",
-                "flatpak-user": "application-x-addon-symbolic", "leftovers": "user-trash-symbolic"}
-_CLEAN_NOUN = {"orphans": "package", "configs": "package", "apt-cache": "file",
-               "leftovers": "item"}
 
 _MON_INTERVAL = 2   # seconds between samples while the System monitor page is visible
 _MON_HISTORY = 60   # samples kept for the history charts (60 × 2 s = 2 minutes)
@@ -2220,7 +1056,6 @@ _CSS = b"""
 .chip { border-radius: 999px; padding: 1px 9px; font-size: 0.8em;
         background-color: alpha(@theme_fg_color, 0.08); }
 .chip-protected { color: #e5a50a; background-color: alpha(#e5a50a, 0.15); }
-.chip-muted { opacity: 0.75; font-style: italic; }
 
 .detail-title { font-size: 1.45em; font-weight: 800; }
 .dialog-title { font-size: 1.25em; font-weight: 800; }
@@ -2243,17 +1078,14 @@ _CSS = b"""
          box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35); }
 .toast label { color: #ffffff; }
 .toast button { color: #ffffff; }
-.toast .toast-action { font-weight: bold; border-radius: 999px; padding: 2px 12px;
-                       background-image: none; background-color: rgba(255, 255, 255, 0.14); }
 """
 
 
-def _run_streaming(argv: list[str], on_line, timeout: int = 900,
-                   env: dict | None = None) -> tuple[int, str]:
+def _run_streaming(argv: list[str], on_line, timeout: int = 900) -> tuple[int, str]:
     """Run argv (never a shell), calling on_line(text) per output line. Returns (rc, tail)."""
     try:
         p = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             text=True, bufsize=1, env={**os.environ, **env} if env else None)
+                             text=True, bufsize=1)
     except FileNotFoundError:
         return 127, f"{argv[0]}: not found"
     killer = threading.Timer(timeout, p.kill)
@@ -2403,8 +1235,6 @@ def run_gui() -> int:
         def __init__(self, item: dict, on_switch, on_delete):
             super().__init__(activatable=False, selectable=False)
             self.item = item
-            skip = item["skip"]
-            never = skip.startswith(("Not used", "Its program"))  # the switch would do nothing
             box = Gtk.Box(spacing=12, margin_top=9, margin_bottom=9,
                           margin_start=10, margin_end=12)
             box.pack_start(icon_image(item.get("icon", ""), "application-x-executable", 36),
@@ -2412,21 +1242,14 @@ def run_gui() -> int:
             text = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2,
                            valign=Gtk.Align.CENTER)
             text.pack_start(label(item["name"], "app-title"), False, False, 0)
-            text.pack_start(label(item.get("comment") or item.get("command")
-                                  or os.path.basename(item["path"]), "dim"), False, False, 0)
+            text.pack_start(label(item.get("comment") or os.path.basename(item["path"]), "dim"),
+                            False, False, 0)
             box.pack_start(text, True, True, 0)
-            if item.get("command"):
-                self.set_tooltip_text(f"Runs: {item['command']}\n{item['path']}")
-            if skip:
-                box.pack_start(chip(skip, "chip-muted"), False, False, 0)
-            elif item["essential"]:
-                box.pack_start(chip("Part of the desktop"), False, False, 0)
-            box.pack_start(chip("Added by you" if item["kind"] == "user" else
-                                "Changed by you" if item["changed"] else "System"),
+            box.pack_start(chip("System" if item["kind"] == "system" else "Added by you"),
                            False, False, 0)
             if item["kind"] == "user":
                 rm = Gtk.Button.new_from_icon_name("user-trash-symbolic", Gtk.IconSize.BUTTON)
-                rm.set_tooltip_text("Delete this startup entry (it goes to the Trash)")
+                rm.set_tooltip_text("Delete this startup entry")
                 rm.set_relief(Gtk.ReliefStyle.NONE)
                 rm.set_valign(Gtk.Align.CENTER)
                 rm.connect("clicked", lambda *_: on_delete(item))
@@ -2435,11 +1258,9 @@ def run_gui() -> int:
             self.switch.set_tooltip_text("Run at login")
             self.switch.connect("notify::active", lambda sw, _p: on_switch(self, sw.get_active()))
             box.pack_start(self.switch, False, False, 0)
-            self.switch.set_no_show_all(never)
-            if never:
-                text.set_opacity(0.6)
             self.add(box)
 
+    # ── system monitor widgets ───────────────────────────────────────────────────────────────
     def is_dark(widget) -> bool:
         fg = widget.get_style_context().get_color(Gtk.StateFlags.NORMAL)
         return 0.2126 * fg.red + 0.7152 * fg.green + 0.0722 * fg.blue > 0.5  # light text
@@ -2676,10 +1497,6 @@ def run_gui() -> int:
             self._au: list[dict] = []
             self._current: dict | None = None
             self._busy = False
-            self._stale = False  # showing the cached last scan while a new one runs
-            self._scan_gen = 0
-            self._cleanup: list[dict] | None = None  # clean-up report, made on first visit
-            self._cleanup_busy = False
             self._toast_token = 0
             self._syncing = False
             self._views = {v[0]: v for v in _VIEWS}
@@ -2714,7 +1531,6 @@ def run_gui() -> int:
             self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
                                    transition_duration=120)
             self.stack.add_named(self._programs_page(), "programs")
-            self.stack.add_named(self._cleanup_page(), "cleanup")
             self.stack.add_named(self._startup_page(), "startup")
             self.stack.add_named(self._monitor_page(), "monitor")
 
@@ -2728,9 +1544,6 @@ def run_gui() -> int:
 
             self.connect("key-press-event", self._on_key)
             self.connect("destroy", Gtk.main_quit)
-            cached = load_scan()  # show the last scan at once; the fresh one replaces it
-            if cached:
-                self._fill_programs(cached[0], stale=True, scanned=cached[1])
             self.refresh_programs()
             self.refresh_startup()
 
@@ -2765,12 +1578,9 @@ def run_gui() -> int:
             card = css(Gtk.Box(spacing=10, margin=12), "machine-card")
             card.pack_start(symbolic("computer-symbolic", 28), False, False, 0)
             txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=1)
-            # one fixed width (floor = cap): a box gives its children their natural width, so a
-            # longer or shorter status line would otherwise resize the sidebar mid-scan
-            fixed = {"width_chars": 20, "max_width_chars": 20}
-            txt.pack_start(label(info["host"], "app-title", **fixed), False, False, 0)
-            txt.pack_start(label(info["os"], "dim", **fixed), False, False, 0)
-            self.scan_label = label(f"Linux {info['kernel']}", "dim", **fixed)
+            txt.pack_start(label(info["host"], "app-title"), False, False, 0)
+            txt.pack_start(label(info["os"], "dim"), False, False, 0)
+            self.scan_label = label(f"Linux {info['kernel']}", "dim")
             txt.pack_start(self.scan_label, False, False, 0)
             card.pack_start(txt, True, True, 0)
             card.set_tooltip_text(f"{info['host']}\n{info['os']}\nKernel {info['kernel']}")
@@ -2792,21 +1602,16 @@ def run_gui() -> int:
             box = css(Gtk.Box(spacing=10), "toast")
             self.toast_spinner = Gtk.Spinner()
             self.toast_label = label("", max_width_chars=80)
-            self.toast_action = css(Gtk.Button(label=""), "toast-action")
-            self.toast_action.connect("clicked", lambda *_: self._on_toast_action())
-            self._toast_cb = None
             self.toast_close = Gtk.Button(image=symbolic("window-close-symbolic"))
             self.toast_close.set_relief(Gtk.ReliefStyle.NONE)
             self.toast_close.connect("clicked", lambda *_: self.hide_notice())
             box.pack_start(self.toast_spinner, False, False, 0)
             box.pack_start(self.toast_label, True, True, 0)
-            box.pack_start(self.toast_action, False, False, 0)
             box.pack_start(self.toast_close, False, False, 0)
             self.toast.add(box)
             return self.toast
 
-        def notify(self, text, kind=None, busy=False, autohide=0, action=None):
-            """Show a toast. action=(label, callback) adds a button such as Undo."""
+        def notify(self, text, kind=None, busy=False, autohide=0):
             self._toast_token += 1
             token = self._toast_token
             warn = kind in (Gtk.MessageType.ERROR, Gtk.MessageType.WARNING)
@@ -2814,18 +1619,9 @@ def run_gui() -> int:
             self.toast_spinner.set_visible(busy)
             (self.toast_spinner.start if busy else self.toast_spinner.stop)()
             self.toast_close.set_visible(not busy)
-            self._toast_cb = action[1] if action else None
-            self.toast_action.set_label(action[0] if action else "")
-            self.toast_action.set_visible(bool(action))
             self.toast.set_reveal_child(True)
             if autohide:
                 GLib.timeout_add_seconds(autohide, lambda: self._autohide(token))
-
-        def _on_toast_action(self):
-            cb, self._toast_cb = self._toast_cb, None
-            self.hide_notice()
-            if cb:
-                cb()
 
         def _autohide(self, token):
             if token == self._toast_token:
@@ -2861,8 +1657,7 @@ def run_gui() -> int:
                                           width_chars=30)
             self.search.connect("search-changed", lambda *_: self._refilter())
             self.sort = Gtk.ComboBoxText(valign=Gtk.Align.CENTER)
-            for key, text in (("name", "Name"), ("size", "Largest first"),
-                              ("recent", "Recently installed")):
+            for key, text in (("name", "Name"), ("size", "Largest first")):
                 self.sort.append(key, text)
             self.sort.set_active_id("name")
             self.sort.set_tooltip_text("Sort order")
@@ -2944,26 +1739,15 @@ def run_gui() -> int:
                                            icon="user-trash-symbolic")
             self.d_uninstall.set_tooltip_text("Uninstall (Delete)")
             self.d_uninstall.connect("clicked", lambda *_: self.on_uninstall())
-            # for software no package manager owns: Move to Trash / Run its uninstaller / …
-            self.d_action = css(Gtk.Button(), "pill")
-            abox = Gtk.Box(spacing=6, halign=Gtk.Align.CENTER)
-            self.d_action_icon = symbolic("user-trash-symbolic")
-            self.d_action_label = Gtk.Label(label="")
-            abox.pack_start(self.d_action_icon, False, False, 0)
-            abox.pack_start(self.d_action_label, False, False, 0)
-            self.d_action.add(abox)
-            self.d_action.connect("clicked", lambda *_: self.on_local_action())
             for b in (self.d_launch, self.d_location, self.d_uninstall):
                 actions.pack_start(b, True, True, 0)
             d.pack_start(actions, False, False, 0)
-            # a row of its own: "Open Wine uninstaller" in the equal-width row above would widen
-            # every button, and the whole pane with them
-            d.pack_start(self.d_action, False, False, 0)
 
             self.d_warn = css(Gtk.Box(spacing=10, margin_top=4), "warning-box")
             self.d_warn.pack_start(symbolic("dialog-warning-symbolic"), False, False, 0)
-            self.d_warn_label = label("", wrap=True)
-            self.d_warn.pack_start(self.d_warn_label, True, True, 0)
+            self.d_warn.pack_start(label("Protected system component. Removing it could break "
+                                         "your desktop, so it can't be uninstalled here.",
+                                         wrap=True), True, True, 0)
             d.pack_start(self.d_warn, False, False, 0)
             self.d_note = css(Gtk.Box(spacing=10, margin_top=4), "info-box")
             self.d_note.pack_start(symbolic("dialog-information-symbolic"), False, False, 0)
@@ -3004,15 +1788,9 @@ def run_gui() -> int:
             if item["source"] == "apt":
                 by = "You" if item.get("manual") else "Came with the system"
             size = item["size"] if item["size"] not in ("", "-") else ("" if local else "unknown")
-            when = ""
-            if item.get("installed"):
-                when = GLib.DateTime.new_from_unix_local(int(item["installed"])).format("%e %b %Y")
             props = [("Type", item.get("kind", "")),
                      ("Package", "" if local else item["id"]),
-                     ("Version", item.get("version") or ("" if local else "—")),
-                     # dpkg's file list changes on upgrades too, so for .debs it's either
-                     ("Installed or updated" if item["source"] == "apt" else "Installed",
-                      when.strip()),
+                     ("Version", "" if local else (item.get("version") or "—")),
                      ("Installed by", by),
                      ("Size on disk", size),
                      ("Installed for", item.get("installation", "")),
@@ -3039,50 +1817,26 @@ def run_gui() -> int:
             self.d_props.show_all()
 
             self.d_warn.set_visible(item["protected"])
-            self.d_warn_label.set_text(
-                "A runtime that Flatpak apps share, so it isn't removed from here. "
-                "`flatpak uninstall --unused` removes the ones no app needs any more."
-                if item.get("runtime") else
-                "Protected system component. Removing it could break your desktop, so it can't "
-                "be uninstalled here.")
-            action = item.get("action") if local else None
             self.d_note.set_visible(local)
-            self.d_note_label.set_text(
-                ("Not managed by a package manager. " if action else
-                 "Not managed by a package manager, so it can't be uninstalled from here. ")
-                + item.get("remove_hint", ""))
+            self.d_note_label.set_text("Not managed by a package manager, so it can't be "
+                                       f"uninstalled from here. {item.get('remove_hint', '')}")
             self.d_launch.set_visible(bool(item.get("desktop")))
             self.d_location.set_visible(local and bool(item.get("location")))
             self.d_uninstall.set_visible(not local)
-            self.d_action.set_visible(bool(action))
-            if action:
-                self.d_action_label.set_text(action["label"])
-                removes = action["type"] in ("trash", "command")
-                self.d_action_icon.set_from_icon_name(
-                    "user-trash-symbolic" if removes else "system-run-symbolic", Gtk.IconSize.MENU)
-                ctx = self.d_action.get_style_context()
-                (ctx.add_class if removes else ctx.remove_class)("destructive-action")
             self._update_actions()
             self.detail_stack.set_visible_child_name("details")
 
         def _update_actions(self):
             item = self._current
-            ready = bool(item) and not self._busy and not self._stale
-            self.d_uninstall.set_sensitive(ready and not item["protected"]
+            self.d_uninstall.set_sensitive(bool(item) and not self._busy
+                                           and not item["protected"]
                                            and item["source"] != "local")
-            self.d_action.set_sensitive(ready)
-            # the list may come from the last scan until the new one is done: act on fresh data
-            wait = "Checking this computer for changes — one moment" if self._stale else ""
-            self.d_uninstall.set_tooltip_text(wait or "Uninstall (Delete)")
-            self.d_action.set_tooltip_text(wait or None)
 
         # ── filtering / paging ───────────────────────────────────────────────────────────
         def _in_view(self, item, view=None):
             view = view or self._view
             if view == "all":
                 return True
-            if view == "local":  # all of it, not just apps: CLI tools, /opt installs, leftovers
-                return item["source"] == "local" and not item.get("runtime")
             if not item.get("is_app"):
                 return False
             return view == "apps" or item["source"] == view
@@ -3096,8 +1850,6 @@ def run_gui() -> int:
         def _sort_key(self, item):
             if self.sort.get_active_id() == "size":
                 return (-item.get("size_kb", 0), item["name"].lower())
-            if self.sort.get_active_id() == "recent":
-                return (-item.get("installed", 0), item["name"].lower())
             return (item["name"].lower(),)
 
         def _row_for(self, item):
@@ -3139,7 +1891,7 @@ def run_gui() -> int:
         def _update_page_header(self):
             _key, title, _icon, _section, desc = self._views[self._view]
             in_view = [i for i in self._rows if self._in_view(i)]
-            noun = {"all": "package", "local": "item"}.get(self._view, "app")
+            noun = "package" if self._view == "all" else "app"
             n = len(in_view)
             kb = sum(i.get("size_kb", 0) for i in in_view)
             sub = f"{n:,} {noun}{'s' if n != 1 else ''}"
@@ -3154,19 +1906,17 @@ def run_gui() -> int:
 
         def _update_counts(self):
             for key, row in self.nav_rows.items():
-                if key not in _PAGES:
+                if key not in ("startup", "monitor"):
                     row.count.set_text(f"{sum(1 for i in self._rows if self._in_view(i, key)):,}")
 
         # ── navigation ───────────────────────────────────────────────────────────────────
         def _on_nav(self, _lb, row):
             if row is None:
                 return
-            if row.key in _PAGES:
+            if row.key in ("startup", "monitor"):
                 self.stack.set_visible_child_name(row.key)
                 if row.key == "monitor":
                     self._monitor_start()
-                elif row.key == "cleanup" and self._cleanup is None and not self._cleanup_busy:
-                    self.refresh_cleanup()
                 return
             self.stack.set_visible_child_name("programs")
             if row.key != self._view:
@@ -3182,33 +1932,19 @@ def run_gui() -> int:
                 self.refresh_startup()
             elif page == "monitor":
                 self._monitor_kick()
-            elif page == "cleanup":
-                self.refresh_cleanup()
             else:
                 self.refresh_programs()
 
         def refresh_programs(self):
-            self._scan_gen += 1
-            gen = self._scan_gen
-            if self._rows:  # keep showing what we have; it's marked as being re-checked
-                self._stale = True
-                self._update_actions()
-                self.scan_label.set_text(f"{len(self._rows):,} items · updating…")
-            else:
-                self.list_stack.set_visible_child_name("loading")
+            self.list_stack.set_visible_child_name("loading")
+            keep = (self._current or {}).get("source"), (self._current or {}).get("id")
 
             def work():
                 rows = list_all()
-                save_scan(rows)
-                GLib.idle_add(self._fill_programs, rows, gen)
+                GLib.idle_add(self._fill_programs, rows, keep)
             threading.Thread(target=work, daemon=True).start()
 
-        def _fill_programs(self, rows, gen=None, stale=False, scanned=None):
-            if gen is not None and gen != self._scan_gen:
-                return False  # an older scan finished after a newer one started
-            keep = (self._current or {}).get("source"), (self._current or {}).get("id")
-            adj = self.list_scroll.get_vadjustment()
-            pos = adj.get_value() if self._rows else 0
+        def _fill_programs(self, rows, keep=(None, None)):
             for child in self.listbox.get_children():
                 self.listbox.remove(child)
             for row in self._row_cache.values():
@@ -3219,22 +1955,13 @@ def run_gui() -> int:
                                       r.get("kind", ""), _SOURCE_LABEL.get(r["source"], ""),
                                       *r.get("includes", []))).lower()
             self._rows = rows
-            self._stale = stale
             self._current = next((r for r in rows if (r["source"], r["id"]) == keep), None)
             self._update_counts()
             self._refilter()
-            if pos:  # a refresh shouldn't throw you back to the top of the list
-                GLib.idle_add(adj.set_value, pos)
             self.list_stack.set_visible_child_name("list")
             self._show_details(self._current)
-            when = (GLib.DateTime.new_from_unix_local(int(scanned)) if scanned
-                    else GLib.DateTime.new_now_local())
-            today = when.format("%F") == GLib.DateTime.new_now_local().format("%F")
-            stamp = when.format("%H:%M" if today else "%e %b %H:%M").strip()
-            self.scan_label.set_text(f"{len(rows):,} items · " + (
-                "updating…" if stale else f"scanned {stamp}"))
-            self.scan_label.set_tooltip_text(f"Showing the scan from {stamp} while this computer "
-                                             "is checked again" if stale else None)
+            self.scan_label.set_text(f"{len(rows):,} items · scanned "
+                                     f"{GLib.DateTime.new_now_local().format('%H:%M')}")
             return False
 
         def _on_row_selected(self, _lb, row):
@@ -3268,70 +1995,11 @@ def run_gui() -> int:
                 self.notify(f"Couldn't open {folder}: {exc.message}", Gtk.MessageType.ERROR,
                             autohide=8)
 
-        # ── software no package manager owns: Trash / its own uninstaller / its own tool ───
-        def on_local_action(self):
-            item = self._current
-            action = (item or {}).get("action")
-            if not action or self._busy or self._stale:
-                return
-            kind = action["type"]
-            if kind == "launch":  # e.g. a Windows program's own "Uninstall X" menu entry
-                info = Gio.DesktopAppInfo.new_from_filename(action["desktop"])
-                try:
-                    if info is None or not info.launch([], None):
-                        raise GLib.Error("could not start")
-                    self.notify(f"Started “{info.get_display_name()}”. Rescan (F5) when it's "
-                                "done.", autohide=10)
-                except GLib.Error as exc:
-                    self.notify(f"Couldn't start it: {exc.message}", Gtk.MessageType.ERROR,
-                                autohide=8)
-                return
-            if kind == "run":  # e.g. Wine's own uninstaller, or Bottles
-                try:
-                    subprocess.Popen(action["argv"], env={**os.environ, **action.get("env", {})},
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL, start_new_session=True)
-                    self.notify(f"{action['label'].replace('Open', 'Opening', 1)}… Rescan (F5) "
-                                "when you're done.", autohide=10)
-                except OSError as exc:
-                    self.notify(f"Couldn't start it: {exc}", Gtk.MessageType.ERROR, autohide=8)
-                return
-            if not self._ask(action["title"], action["text"], action["label"]):
-                return
-            if kind == "trash":
-                ok, msg = trash_paths(action["paths"])
-                if not ok:
-                    self._msg(Gtk.MessageType.ERROR, f"Couldn't move {item['name']} to the Trash",
-                              msg)
-                    return
-                paths = list(action["paths"])
-                self.notify(f"Moved {item['name']} to the Trash.", autohide=12,
-                            action=("Undo", lambda: self._undo_trash(item["name"], paths,
-                                                                     self.refresh_programs)))
-                self._current = None
-                self.refresh_programs()
-            elif kind == "command":
-                self._exec_remove(item, False, action)
-
-        def _undo_trash(self, name, paths, then):
-            ok, msg = restore_from_trash(paths)
-            if ok:
-                self.notify(f"Restored {name}.", autohide=6)
-            else:
-                self._msg(Gtk.MessageType.ERROR, f"Couldn't restore {name}",
-                          f"{msg}\n\nYou can still restore it from the Trash in Files.")
-            then()
-
         # ── uninstall flow ───────────────────────────────────────────────────────────────
         def on_uninstall(self):
             item = self._current
-            if item and item["source"] == "local":
-                # Delete only ever *removes* (and asks first); it never launches an uninstaller
-                if (item.get("action") or {}).get("type") in ("trash", "command"):
-                    self.on_local_action()
-                return
-            if not item or self._busy or self._stale:
-                return
+            if not item or self._busy or item["source"] == "local":
+                return  # not package-managed: nothing we can safely uninstall
             if item["protected"]:
                 self._msg(Gtk.MessageType.ERROR, f"“{item['name']}” is protected",
                           "It's an essential system component — removing it could break "
@@ -3429,32 +2097,27 @@ def run_gui() -> int:
             dlg.destroy()
             return resp == Gtk.ResponseType.OK, do_purge
 
-        def _exec_remove(self, item, purge, tool=None):
-            """Package managers via pkexec; `tool` (a command action) runs as you instead."""
+        def _exec_remove(self, item, purge):
             self._set_busy(True)
             name = item["name"]
-            self.notify(f"Uninstalling {name}…" + ("" if tool else " waiting for authentication"),
-                        busy=True)
-            argv = tool["argv"] if tool else remove_command(item, purge)
+            self.notify(f"Uninstalling {name}… waiting for authentication", busy=True)
+            argv = remove_command(item, purge)
 
             def progress(line):
                 GLib.idle_add(self.toast_label.set_text, f"Uninstalling {name}… {line[:120]}")
 
             def work():
-                rc, tail = _run_streaming(argv, progress, env=(tool or {}).get("env") or None)
-                GLib.idle_add(self._done_remove, item, rc, tail, not tool)
+                rc, tail = _run_streaming(argv, progress)
+                GLib.idle_add(self._done_remove, item, rc, tail)
             threading.Thread(target=work, daemon=True).start()
 
-        def _done_remove(self, item, rc, tail, via_pkexec=True):
+        def _done_remove(self, item, rc, tail):
             self._set_busy(False)
             if rc == 0:
-                self.notify(f"{item['name']} was uninstalled.", autohide=8,
-                            action=("Clean up", lambda: self._go("cleanup"))
-                            if item["source"] == "apt" else None)
+                self.notify(f"{item['name']} was uninstalled.", autohide=8)
                 self._current = None
-                self._cleanup = None  # what's unused has changed
                 self.refresh_programs()
-            elif via_pkexec and rc in (126, 127):  # pkexec: dialog dismissed / not authorized
+            elif rc in (126, 127):  # pkexec: dialog dismissed / not authorized
                 self.notify("Uninstall cancelled — authentication was dismissed or refused.",
                             Gtk.MessageType.WARNING, autohide=8)
             else:
@@ -3469,15 +2132,6 @@ def run_gui() -> int:
             page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
             head, title, self.startup_sub = self._page_header()
             title.set_text("Startup apps")
-            tools = Gtk.Box(spacing=10, valign=Gtk.Align.CENTER)
-            tools.pack_start(label("Show background services", "dim", ellipsize=False),
-                             False, False, 0)
-            self.au_bg = Gtk.Switch(valign=Gtk.Align.CENTER)
-            self.au_bg.set_tooltip_text("Also list the services your desktop starts on its own "
-                                        "(GNOME's Startup Applications hides these)")
-            self.au_bg.connect("notify::active", lambda *_: self._fill_startup())
-            tools.pack_start(self.au_bg, False, False, 0)
-            head.pack_end(tools, False, False, 0)
             page.pack_start(head, False, False, 0)
             page.pack_start(label(self._views["startup"][4], "dim", wrap=True, margin_start=28,
                                   margin_end=28, margin_bottom=16), False, False, 0)
@@ -3494,306 +2148,42 @@ def run_gui() -> int:
 
         def refresh_startup(self):
             self._au = list_autostart()
-            self._fill_startup()
-            return False
-
-        def _startup_shown(self):
-            show_bg = self.au_bg.get_active()
-            # what you added or changed is always listed, so you can always undo it
-            return [a for a in self._au
-                    if show_bg or not a["background"] or a["kind"] == "user" or a["changed"]]
-
-        def _fill_startup(self):
             for child in self.au_list.get_children():
                 child.destroy()
-            for a in self._startup_shown():
+            for a in self._au:
                 self.au_list.add(StartupRow(a, self._on_startup_switch, self._on_startup_delete))
             self.au_list.show_all()
             self._update_startup_header()
+            return False
 
         def _update_startup_header(self):
-            shown = self._startup_shown()
-            on = sum(1 for a in shown if a["enabled"] and not a["skip"])
-            hidden = len(self._au) - len(shown)
-            self.startup_sub.set_text(f"{on} of {len(shown)} start when you log in"
-                                      + (f"  ·  {hidden} background services hidden"
-                                         if hidden else ""))
-            self.nav_rows["startup"].count.set_text(str(len(shown)))
+            on = sum(1 for a in self._au if a["enabled"])
+            self.startup_sub.set_text(f"{on} of {len(self._au)} start when you log in")
+            self.nav_rows["startup"].count.set_text(str(len(self._au)))
 
         def _on_startup_switch(self, row, active):
-            item = row.item
-            # a switch flipped back by revert() can notify *after* _syncing is cleared again
-            # (GTK defers it), so also ignore any change that matches the entry's own state
-            if self._syncing or active == item["enabled"]:
+            if self._syncing:
                 return
-
-            def revert():
+            item = row.item
+            try:
+                set_autostart_enabled(item, active)
+                item["enabled"] = active
+                self._update_startup_header()
+                self.notify(f"{item['name']} will {'now' if active else 'no longer'} "
+                            "start at login.", autohide=4)
+            except OSError as exc:
                 self._syncing = True
                 row.switch.set_active(not active)
                 self._syncing = False
-            if not active and item["essential"] and not self._ask(
-                    f"Turn off {item['name']}?",
-                    "It's part of your desktop and starts early in the login session. Turning it "
-                    "off can break things like power management, keyboard shortcuts or saved "
-                    "passwords. You can turn it back on here at any time.", "Turn off"):
-                revert()
-                return
-            try:
-                set_autostart_enabled(item, active)
-            except OSError as exc:
-                revert()
                 self._msg(Gtk.MessageType.ERROR, "Couldn't change startup setting", str(exc))
-                return
-            self.notify(f"{item['name']} will {'now' if active else 'no longer'} start at login.",
-                        autohide=4)
-            GLib.idle_add(self.refresh_startup)  # not from inside the switch's own signal
 
         def _on_startup_delete(self, item):
-            if not self._ask(f"Delete startup entry “{item['name']}”?",
-                             "It goes to the Trash, so you can restore it. The program itself "
-                             "stays installed.", "Delete"):
-                return
-            ok, msg = remove_autostart(item)
-            if not ok:
-                self._msg(Gtk.MessageType.ERROR, "Couldn't delete the startup entry", msg)
-                return
-            path = item["path"]
-            self.notify(f"Removed “{item['name']}” from startup.", autohide=12,
-                        action=("Undo", lambda: self._undo_trash(item["name"], [path],
-                                                                 self.refresh_startup)))
-            self.refresh_startup()
-
-        # ── clean-up page ────────────────────────────────────────────────────────────────
-        def _cleanup_page(self):
-            page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
-            head, title, self.cleanup_sub = self._page_header()
-            title.set_text("Clean up")
-            page.pack_start(head, False, False, 0)
-            page.pack_start(label(self._views["cleanup"][4], "dim", wrap=True, margin_start=28,
-                                  margin_end=28, margin_bottom=16), False, False, 0)
-            self.cleanup_stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE,
-                                           margin_start=28, margin_end=28, margin_bottom=24)
-            loading = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                              valign=Gtk.Align.CENTER, halign=Gtk.Align.CENTER)
-            spinner = Gtk.Spinner(width_request=32, height_request=32)
-            spinner.start()
-            loading.pack_start(spinner, False, False, 0)
-            loading.pack_start(label("Looking for things nothing needs any more…\nAPT's check "
-                                     "can take a while on a busy computer.", "dim", xalign=0.5,
-                                     wrap=True, justify=Gtk.Justification.CENTER),
-                               False, False, 0)
-            card = css(Gtk.Box(), "card")
-            card.pack_start(loading, True, True, 0)
-            self.cleanup_stack.add_named(card, "loading")
-            self.cleanup_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12,
-                                       margin_bottom=4)
-            self.cleanup_stack.add_named(scrolled(self.cleanup_box), "list")
-            page.pack_start(self.cleanup_stack, True, True, 0)
-            return page
-
-        def refresh_cleanup(self):
-            if self._cleanup_busy:
-                return
-            self._cleanup_busy = True
-            self.cleanup_stack.set_visible_child_name("loading")
-            self.cleanup_sub.set_text("Checking…")
-            rows = list(self._rows)
-
-            def work():
-                cats = cleanup_report(rows)
-                GLib.idle_add(self._fill_cleanup, cats)
-            threading.Thread(target=work, daemon=True).start()
-
-        def _fill_cleanup(self, cats):
-            self._cleanup_busy = False
-            self._cleanup = cats
-            for child in self.cleanup_box.get_children():
-                child.destroy()
-            for c in cats:
-                if c["key"] == "flatpak-user" and not c["items"]:
-                    continue  # one "nothing unused" Flatpak card is enough
-                self.cleanup_box.pack_start(self._cleanup_card(c), False, False, 0)
-            self.cleanup_box.show_all()
-            self.cleanup_stack.set_visible_child_name("list")
-            free = sum(c["kb"] for c in cats if c["argv"] and c["items"] and not c["blocked"])
-            self.cleanup_sub.set_text(f"About {_human_kb(free)} can be freed" if free
-                                      else "Nothing to clean up")
-            self.nav_rows["cleanup"].count.set_text(_human_kb(free) if free else "")
-            return False
-
-        def _cleanup_card(self, c):
-            n = len(c["items"])
-            card = css(Gtk.Box(orientation=Gtk.Orientation.VERTICAL), "card")
-            top = Gtk.Box(spacing=14, margin=16)
-            top.pack_start(symbolic(_CLEAN_ICONS.get(c["key"], "edit-clear-all-symbolic"),
-                                    24), False, False, 0)
-            txt = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3,
-                          valign=Gtk.Align.CENTER)
-            txt.pack_start(label(c["title"], "app-title"), False, False, 0)
-            noun = _CLEAN_NOUN.get(c["key"], "runtime")
-            count = f"{n} {noun}{'s' if n != 1 else ''}" if n else "Nothing to clean"
-            txt.pack_start(label(f"{count}  ·  {c['summary']}", "dim", wrap=True),
-                           False, False, 0)
-            top.pack_start(txt, True, True, 0)
-            if c["kb"]:
-                top.pack_start(label(_human_kb(c["kb"]), "app-title", ellipsize=False,
-                                     valign=Gtk.Align.CENTER), False, False, 0)
-            if c["argv"]:
-                btn = pill_button(f"{c['action']}…", *(("destructive-action",) if n else ()))
-                btn.set_valign(Gtk.Align.CENTER)
-                btn.set_sensitive(bool(n) and not c["blocked"])
-                btn.connect("clicked", lambda *_: self._cleanup_review(c))
-                top.pack_start(btn, False, False, 0)
-            card.pack_start(top, False, False, 0)
-            if c["blocked"]:
-                warn = css(Gtk.Box(spacing=10, margin_start=16, margin_end=16, margin_bottom=16),
-                           "warning-box")
-                warn.pack_start(symbolic("dialog-warning-symbolic"), False, False, 0)
-                warn.pack_start(label(
-                    "Blocked: this would remove essential system package(s): "
-                    f"{', '.join(c['blocked'][:6])}. That usually means a desktop meta-package was "
-                    "removed — reinstall it instead of cleaning up.", wrap=True), True, True, 0)
-                card.pack_start(warn, False, False, 0)
-            if c["key"] == "leftovers" and n:
-                lst = css(Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, margin_bottom=8),
-                          "app-list")
-                for it in c["items"]:
-                    row = Gtk.ListBoxRow()
-                    row.ref = it["ref"]
-                    hb = Gtk.Box(spacing=12, margin_top=8, margin_bottom=8, margin_start=54,
-                                 margin_end=16)
-                    hb.pack_start(label(it["name"]), True, True, 0)
-                    hb.pack_start(label(it["kind"], "dim", ellipsize=False), False, False, 0)
-                    hb.pack_start(label(_human_kb(it["kb"]) if it["kb"] else "", "dim",
-                                        xalign=1.0, width_chars=8, ellipsize=False),
-                                  False, False, 0)
-                    hb.pack_start(symbolic("go-next-symbolic"), False, False, 0)
-                    row.add(hb)
-                    row.set_tooltip_text("Show it, and how to clear it")
-                    lst.add(row)
-                lst.connect("row-activated", lambda _l, r: self._reveal_ref(r.ref))
-                card.pack_start(lst, False, False, 0)
-            return card
-
-        def _cleanup_review(self, c):
-            if self._busy:  # one apt/flatpak operation at a time (they share a lock)
-                self.notify("Wait for the current task to finish first.", autohide=5)
-                return
-            n, kb, key = len(c["items"]), c["kb"], c["key"]
-            s = "s" if n != 1 else ""
-            dlg = Gtk.Dialog(transient_for=self, modal=True, title=c["title"])
-            dlg.set_default_size(520, -1)
-            dlg.set_resizable(False)
-            dlg.add_button("Cancel", Gtk.ResponseType.CANCEL)
-            go = css(dlg.add_button(c["action"], Gtk.ResponseType.OK), "destructive-action")
-            dlg.set_default_response(Gtk.ResponseType.CANCEL)
-            go.set_can_default(False)
-            area = dlg.get_content_area()
-            area.set_spacing(12)
-            area.set_margin_start(22)
-            area.set_margin_end(22)
-            area.set_margin_top(18)
-            area.set_margin_bottom(10)
-            heading = {"orphans": f"Remove {n} unused package{s}?",
-                       "configs": f"Delete the leftover settings of {n} removed package{s}?",
-                       "apt-cache": f"Delete {n} downloaded package file{s}?"}.get(
-                key, f"Remove {n} unused runtime{s}?")
-            area.pack_start(label(heading, "dialog-title", wrap=True), False, False, 0)
-            if kb:
-                area.pack_start(label(f"This frees about {_human_kb(kb)}.", wrap=True),
-                                False, False, 0)
-            lst = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
-            for it in sorted(c["items"], key=lambda i: (-i["kb"], i["name"])):
-                hb = Gtk.Box(spacing=12, margin=4, margin_start=10, margin_end=10)
-                hb.pack_start(label(it["name"]), True, True, 0)
-                hb.pack_start(label(_human_kb(it["kb"]) if it["kb"] else "", "dim",
-                                    ellipsize=False), False, False, 0)
-                lst.add(hb)
-            sw = scrolled(lst, "pkg-list")
-            sw.set_min_content_height(min(30 * n, 240))
-            area.pack_start(sw, False, False, 0)
-            note = {"orphans": "Nothing installed depends on them. If you miss something later, "
-                               "reinstall it by name.",
-                    "configs": "Only settings of packages that are already uninstalled. Your "
-                               "personal files aren't touched.",
-                    "apt-cache": "APT downloads them again if it ever needs them."}.get(
-                key, "Flatpak downloads a runtime again if an app needs it.")
-            if c["argv"][0] == "pkexec":
-                note += " You'll be asked for your password."
-            area.pack_start(label(note, "dim", wrap=True), False, False, 0)
-            dlg.show_all()
-            resp = dlg.run()
-            dlg.destroy()
-            if resp == Gtk.ResponseType.OK:
-                self._run_cleanup(c)
-
-        def _run_cleanup(self, c):
-            self._set_busy(True)
-            title = c["title"]
-            self.notify(f"{title}: checking nothing has changed…", busy=True)
-
-            def progress(line):
-                GLib.idle_add(self.toast_label.set_text, f"{title}… {line[:120]}")
-
-            def work():
-                problem = verify_cleanup(c)  # the list could be minutes old by now
-                if problem:
-                    GLib.idle_add(self._cleanup_done, c, None, problem)
-                    return
-                GLib.idle_add(self.toast_label.set_text, f"{title}… waiting for authentication")
-                rc, tail = _run_streaming(c["argv"], progress)
-                GLib.idle_add(self._cleanup_done, c, rc, tail)
-            threading.Thread(target=work, daemon=True).start()
-
-        def _cleanup_done(self, c, rc, tail):
-            self._set_busy(False)
-            if rc is None:
-                self.hide_notice()
-                self._msg(Gtk.MessageType.WARNING, "Nothing was changed", tail)
-            elif rc == 0:
-                self.notify(f"Done — freed about {_human_kb(c['kb'])}." if c["kb"] else "Done.",
-                            autohide=8)
-                if c["key"] in ("orphans", "configs"):
-                    self.refresh_programs()
-            elif c["argv"][0] == "pkexec" and rc in (126, 127):
-                self.notify("Cancelled — authentication was dismissed or refused.",
-                            Gtk.MessageType.WARNING, autohide=8)
-                return False
-            else:
-                self.notify(f"{c['title']} failed (exit code {rc}).", Gtk.MessageType.ERROR,
-                            autohide=10)
-                self._msg(Gtk.MessageType.ERROR, f"{c['title']} failed",
-                          (tail or "unknown error").strip()[-1500:])
-            self._cleanup = None
-            self.refresh_cleanup()
-            return False
-
-        def _reveal_ref(self, ref):
-            """Jump from a clean-up entry to the item in the Unmanaged list, selected."""
-            item = next((r for r in self._rows if [r["source"], r["id"]] == list(ref)), None)
-            if item is None:
-                self.notify("That item isn't there any more.", autohide=5)
-                return
-
-            def reveal():
-                self._refilter()
-                idx = next((i for i, m in enumerate(self._matches) if m is item), -1)
-                if idx < 0:
-                    self._show_details(item)
-                    return False
-                while self._shown <= idx:
-                    self._render_more()
-                row = self._row_cache.get((item["source"], item["id"]))
-                if row is not None:
-                    self.listbox.select_row(row)
-                    row.grab_focus()
-                return False
-            self._go("local")
-            if self.search.get_text():
-                self.search.set_text("")
-                GLib.timeout_add(300, reveal)  # after the search box's own delayed refilter
-            else:
-                reveal()
+            if self._ask(f"Delete startup entry “{item['name']}”?",
+                         "It will no longer start at login. The program itself stays installed.",
+                         "Delete"):
+                remove_autostart(item)
+                self.refresh_startup()
+                self.notify(f"Removed “{item['name']}” from startup.", autohide=4)
 
         # ── system monitor page ──────────────────────────────────────────────────────────
         def _load_viz_css(self):
@@ -4183,12 +2573,10 @@ def run_gui() -> int:
 
         def _show_about(self):
             dlg = Gtk.AboutDialog(transient_for=self, modal=True, program_name="App Manager",
-                                  version=__version__,
                                   logo_icon_name="system-software-install",
                                   comments="See everything installed on this computer — "
-                                           "APT, Flatpak, Snap, Windows programs, AppImages "
-                                           "and more — uninstall safely, and clean up what's "
-                                           "left behind.")
+                                           "APT, Flatpak, Snap, web apps and more — and "
+                                           "uninstall safely.")
             dlg.run()
             dlg.destroy()
 
@@ -4196,7 +2584,7 @@ def run_gui() -> int:
             self._msg(Gtk.MessageType.INFO, "Keyboard shortcuts",
                       "Type anywhere — search\n"
                       "Ctrl+F — focus search\n"
-                      "Delete — uninstall (or remove) the selected item\n"
+                      "Delete — uninstall the selected app\n"
                       "F5 or Ctrl+R — rescan (or take a reading now, on System monitor)\n"
                       f"Ctrl+1 … Ctrl+{len(_VIEWS)} — jump to a sidebar section")
 
@@ -4234,8 +2622,7 @@ def run_gui() -> int:
 
 
 def main(argv: list[str]) -> int:
-    if any(a in argv for a in ("--list", "--check", "--json", "--apps", "--monitor",
-                               "--startup", "--cleanup")):
+    if any(a in argv for a in ("--list", "--check", "--json", "--apps", "--monitor")):
         return _cli(argv)
     if "-h" in argv or "--help" in argv:
         print(__doc__)

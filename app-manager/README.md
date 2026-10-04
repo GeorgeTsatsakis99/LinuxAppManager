@@ -1,6 +1,6 @@
 # App Manager
 
-A small GTK app for Linux that shows you **everything installed on your machine**: apt packages, snaps, flatpaks, browser web apps, AppImages and random stuff you dropped in `/opt`. It lets you uninstall things without having to remember which package manager they came from.
+A small GTK app for Linux that shows you **everything installed on your machine**: apt packages, snaps, flatpaks, Windows programs running under Wine or Bottles, browser web apps, AppImages, command-line tools and random stuff you dropped in `/opt`. It lets you uninstall things without having to remember which package manager they came from, and cleans up what uninstalls leave behind.
 
 I wrote it because on my Zorin box I kept doing the same routine: "is this thing a flatpak or a .deb? what's the package even called? will `apt remove` take half my desktop with it?". The distro's software center only knows about the software it installed itself, and Synaptic shows 3,000 packages with names like `libgnome-desktop-4-2t64`. I wanted one window that answers *what's on this computer* and makes removing things hard to get wrong.
 
@@ -14,7 +14,7 @@ It's a single Python file with no dependencies beyond what a GNOME-based desktop
 
 **Layout**
 
-A sidebar on the left (Applications, one entry per source, All packages, Startup apps and System monitor, each with a live count, plus a card showing the machine's hostname, OS and when it was last scanned). The page in the middle has a title, stats ("88 apps · 6.5 GB on disk") and search. On the right, a details panel for whatever you selected. Status messages pop up as a small toast at the bottom instead of a dialog.
+A sidebar on the left (Applications, one entry per source, All packages, Clean up, Startup apps and System monitor, each with a live count, plus a card showing the machine's hostname, OS and when it was last scanned). The page in the middle has a title, stats ("102 apps · 11.2 GB on disk") and search. On the right, a details panel for whatever you selected. Status messages pop up as a small toast at the bottom instead of a dialog.
 
 **Programs**
 
@@ -23,17 +23,42 @@ A sidebar on the left (Applications, one entry per source, All packages, Startup
   - **APT / dpkg**: every installed package (not just the ones you installed by hand), each marked *installed by you* or *came with the system*
   - **Snap**
   - **Flatpak** (system and user installations)
-  - **Other**: things no package manager owns: browser web apps (Brave/Chrome "install as app"), AppImages, vendor installers (VMware etc.), your own scripts with a `.desktop` file, and launchers whose program is gone
-- **Applications** shows the ~90 things that are actually apps; **All packages** shows all ~2,900, libraries included
-- Search (name, description, package id, and the names of extra apps a package bundles) and sort by name or by size on disk
-- Details panel: source / "Installed by you" / "Preinstalled" / "Protected" chips, **Open**, **Show files**, **Uninstall**, and a property list (package, version, size, location…)
+  - **Flatpak runtimes** (in *All packages*, read-only: they're what `flatpak uninstall --unused` is for)
+  - **Other**: things no system package manager owns:
+    - **Windows programs** in every Wine prefix and Bottles bottle, read from the prefix's own *Add/Remove programs* registry, so agents and tools with no menu entry show up too, merged with their Start-menu entries (WPS Office's six launchers become one app)
+    - browser web apps (Brave/Chrome "install as app"), **AppImages** (even ones with no launcher, e.g. sitting in `~/Documents`), your own scripts with a `.desktop` file
+    - vendor installs in `/opt` and `/usr/local` (netdata, ollama, VMware…), with the vendor's own uninstaller if it ships one
+    - command-line tools: `~/.local/bin`, `pipx`, `npm -g`, `cargo install`, rustup toolchains
+    - **leftovers**: launchers whose program is gone, Windows programs whose folder is gone (or holds only `unins000.exe`), empty folders in `/opt`
+- **Applications** shows the ~100 things that are actually apps; **Unmanaged** everything no package manager tracks (each with how to remove it); **All packages** all ~3,000 entries, libraries and runtimes included
+- Search (name, description, package id, and the names of extra apps a package bundles) and sort by name, by size on disk, or by **recently installed**
+- Details panel: source / "Installed by you" / "Preinstalled" / "Protected" chips, **Open**, **Show files**, **Uninstall**, and a property list (package, version, install date, size, location…)
 - Uninstall runs through `pkexec`, so you get the normal system password prompt, and the package manager's output streams into the window while it works
+- **Things no package manager owns get their own way out**, where one is safe:
+  - **Move to Trash** for AppImages (with their launchers), leftover launchers and your own scripts in `~/.local/bin`; **Remove from menu** for your own programs' launchers. It's reversible, and the toast offers **Undo**.
+  - **Run its uninstaller** for a Windows program that ships one, otherwise **Open Wine uninstaller** (in the right prefix), or **Open Bottles** for programs inside a bottle
+  - **Uninstall** for `pipx`, `npm -g` (your own Node), `cargo install` and rustup toolchains, by running that tool's own uninstall command as you, after showing you the exact command
+  - Web apps, `/opt` and `/usr/local` installs only say how to remove them (that needs the browser, or root plus the vendor's steps)
+- **Opens instantly**: the window shows the last scan straight away and refreshes it in the background ("updating…"). Buttons that change anything stay disabled until the fresh scan is in.
+
+**Clean up**
+
+- One page with everything nothing needs any more, each with its size:
+  - **Unused packages**: what `apt autoremove` would remove (here: 37 Qt/Wireshark libraries, 193 MB, left by an earlier uninstall)
+  - **Leftover settings** of packages that are already uninstalled (`rc` in dpkg), including the module folders old kernels leave in `/lib/modules`
+  - **Downloaded package files** APT keeps in `/var/cache/apt/archives`
+  - **Unused Flatpak runtimes**, decided by Flatpak's own rules
+  - **Leftovers from removed apps** found by the scan (dead launchers, Windows programs whose folder is gone, empty `/opt` folders). Click one to jump to it and its fix.
+- Every button first shows the exact list. Right before running, the app checks that the list still matches (and blocks anything that would touch an essential package). Then it runs one `pkexec` command.
+- After you uninstall a `.deb`, the toast offers a jump to Clean up, because that's when packages become unused.
 
 **Startup apps**
 
-- Everything that starts at login, with a switch per entry
-- Turning off a *system* entry doesn't touch `/etc`. It writes a per-user override in `~/.config/autostart`, which is how GNOME expects it to be done, and you can switch it back on at any time
-- Entries you added yourself can be deleted
+- What starts at login, with a switch per entry, and **what really runs**: entries that never start on your desktop (`OnlyShowIn`/`NotShowIn`, a missing `TryExec` program) are marked "Not used on GNOME" and have no switch, and condition-gated ones (Orca) say so
+- Background services (the ~30 `NoDisplay` entries GNOME's own Startup Applications hides) are behind **Show background services**. Anything you added or changed is always listed, so you can always undo it.
+- Services your desktop starts in an early session phase (gnome-settings-daemon plugins, the keyring) are marked **Part of the desktop**, and turning one off asks first
+- Turning off a *system* entry doesn't touch `/etc`. It writes a per-user override in `~/.config/autostart`, which is how GNOME expects it to be done, and you can switch it back on at any time. Such an override is shown as **Changed by you**, not as a separate entry.
+- Entries you added yourself can be deleted. They go to the Trash, with **Undo**.
 
 **System monitor**
 
@@ -50,9 +75,9 @@ A sidebar on the left (Applications, one entry per source, All packages, Startup
 
 | | |
 |---|---|
+| ![Clean up](docs/screenshots/cleanup.png) | ![Startup apps](docs/screenshots/startup.png) |
 | ![Confirm dialog](docs/screenshots/confirm-uninstall.png) | ![Protected package](docs/screenshots/protected.png) |
-| ![Other apps](docs/screenshots/other-apps.png) | ![Startup apps](docs/screenshots/startup.png) |
-| ![All packages](docs/screenshots/all-packages.png) | |
+| ![Windows program](docs/screenshots/windows-app.png) | ![All packages](docs/screenshots/all-packages.png) |
 
 ---
 
@@ -72,7 +97,11 @@ Uninstalling is the one destructive thing this app does, so most of the code aro
 
 6. **Cancel is the default button** in the confirm dialog, so hammering Enter won't uninstall anything.
 
-7. **"Other" apps are read-only.** If no package manager owns something, there's no safe, reversible way to remove it automatically. So the app tells you what it is and where it lives, and suggests how to remove it (e.g. "remove it from `brave://apps`"), but won't delete files itself.
+7. **Things no package manager owns are only removed reversibly, or by their own uninstaller.** The app never deletes such files outright. *Move to Trash* only accepts files inside your home folder (no folders, nothing system-wide) and can be undone. Windows programs are handed to their own uninstaller or Wine's. `pipx`/`npm`/`cargo`/`rustup` run their own uninstall command as you, never as root, after showing the exact command. Everything else (web apps, `/opt`, `/usr/local`) just tells you how.
+
+8. **Clean-up actions are re-checked right before they run.** The list you confirmed may be minutes old, so apt is asked again (`apt-get -s remove …` / `-s purge …`). If the set changed, or would now touch an essential package, nothing happens and you're told why. Leftover settings of the *running* kernel are never offered.
+
+9. **Startup changes are user-level and reversible.** System entries are only ever switched off for your account, never deleted. Session-critical ones ask before turning off. Your own entries go to the Trash.
 
 What it does **not** protect you from: removing an app you actually wanted. It will happily uninstall Firefox if you click through the dialog.
 
@@ -124,9 +153,9 @@ Keywords=uninstall;remove;programs;apps;startup;autostart;packages;
 |---|---|
 | just start typing | search (on any programs page) |
 | `Ctrl+F` | focus search |
-| `Delete` | uninstall the selected program |
-| `F5` / `Ctrl+R` | rescan the computer (on System monitor: take a reading now) |
-| `Ctrl+1` … `Ctrl+8` | jump to a sidebar section |
+| `Delete` | uninstall (or, for things no package manager owns, remove) the selected item, always after a confirm |
+| `F5` / `Ctrl+R` | rescan the computer (on Clean up: check again; on System monitor: take a reading now) |
+| `Ctrl+1` … `Ctrl+9` | jump to a sidebar section |
 
 ## Command line
 
@@ -134,11 +163,13 @@ The backend works without a display, which is handy over SSH or in scripts:
 
 ```bash
 python3 app-manager.py --list                 # everything installed, one line each
-python3 app-manager.py --list --apps          # only things with a launcher (incl. web apps, AppImages)
+python3 app-manager.py --list --apps          # only apps (incl. Windows programs, web apps, AppImages)
 python3 app-manager.py --list --apps --json   # same, as JSON
 python3 app-manager.py --check gparted        # what would `apt remove gparted` take with it?
 python3 app-manager.py --monitor              # one system-monitor snapshot (takes ~1 s)
 python3 app-manager.py --monitor --json       # same, as JSON
+python3 app-manager.py --startup              # what starts at login, and what really runs
+python3 app-manager.py --cleanup              # what could be cleaned up, item by item (changes nothing)
 ```
 
 `--monitor` output on my laptop:
@@ -183,25 +214,59 @@ Package managers only know about their own packages, and none of them knows whic
 
 | Source | Command | Notes |
 |---|---|---|
-| apt | `dpkg-query -W` | Only status `ii` (installed). `rc` = removed but config left behind is skipped. `apt-mark showmanual` decides "installed by you" vs "came with the system". |
+| apt | `dpkg-query -W` | Only status `ii` (installed). `rc` = removed but config left behind is skipped (Clean up offers those). "Installed by you" vs "came with the system" comes from APT's own state file, `/var/lib/apt/extended_states`. That's the same answer `apt-mark showmanual` gives (296 = 296 here), but in ~0.05 s instead of 1.5–7 s. The install date is when dpkg last wrote the package's file list. |
 | snap | `snap list` | Size = sum of all stored revisions in `/var/lib/snapd/snaps`, since removing a snap frees all of them. |
 | flatpak | `flatpak list --app --columns=…` | The size column is locale-formatted (`2,1 MB` with a non-breaking space on a Greek locale, which took me a while to notice), so it gets parsed rather than trusted. |
+| flatpak runtimes | `flatpak list --runtime` | Listed under *All packages* only, and protected: removing a runtime an app needs breaks the app. |
 
 **2. Read every launcher (`.desktop` file) the desktop would show**
 
-The app walks the XDG application directories in the same precedence order the menu uses: `~/.local/share/applications` first, then everything in `$XDG_DATA_DIRS` (flatpak exports, snap's desktop dir, `/usr/local/share`, `/usr/share`). A launcher in your home folder with the same file name as a system one **overrides** it, just like in the real menu. Launchers with `NoDisplay`/`Hidden`, or excluded by `OnlyShowIn`/`NotShowIn` for your desktop, are ignored.
+The app walks the XDG application directories in the same precedence order the menu uses: `~/.local/share/applications` first, then everything in `$XDG_DATA_DIRS` (flatpak exports, snap's desktop dir, `/usr/local/share`, `/usr/share`). **Sub-folders count**: per the spec `wine/Programs/AnyDesk/AnyDesk.desktop` is the desktop-id `wine-Programs-AnyDesk-AnyDesk.desktop`, and that's where Wine puts every Windows program's menu entry (an early version only read the top level and missed all of them). A launcher in your home folder with the same desktop-id as a system one **overrides** it, just like in the real menu. Launchers with `NoDisplay`/`Hidden`, a `TryExec` program that isn't installed, or excluded by `OnlyShowIn`/`NotShowIn` for your desktop, are ignored.
 
 **3. Match each launcher to an owner**
 
-- Launchers in flatpak's export dir → the flatpak with that app id
+- A launcher whose `Exec=` just runs `flatpak run <app-id>` / `snap run <name>` → that flatpak or snap, whoever wrote the file (Zorin ships its own `com.usebottles.bottles.desktop` that starts the Bottles flatpak; it used to be credited to a `.deb` of desktop files)
+- Launchers in flatpak's export dir, or a user override with a flatpak's app id as its name → that flatpak
 - Launchers in snap's desktop dir → the snap named in the file (`<snap>_<app>.desktop`)
 - Everything else → one batched `dpkg-query -S` call over all launcher paths to find the owning `.deb`
 - Still no owner? Parse the launcher's `Exec=` line (strip `%U`-style field codes and `env VAR=…` prefixes, resolve through `$PATH`) and ask dpkg who owns *that binary*. This catches packaged apps whose launcher you created by hand.
+- A launcher that runs `wine … something.lnk/.exe` (or a Bottles `-b <bottle>` entry) → set aside for step 4
 - Still nothing → it's an **Other** app, classified from its `Exec=` line: web app (`--app-id=`), AppImage, something in your home folder, a manual install, or a launcher pointing at a program that no longer exists.
 
 If one package ships several launchers (Maltego plus its Java config tool, or Zorin's Wine bundle with *Browse C: Drive* / *Configure Wine* / *Uninstall Wine Software*), the best match becomes the row's name, and the rest are listed under **Includes** and are searchable.
 
-Whole scan on my machine (2,926 packages, ~90 launchers): about **1.3 s**, most of it `dpkg-query`.
+**4. Windows programs (Wine, Bottles)**
+
+Wine only creates a menu entry for Start-menu shortcuts, so menus alone miss agents, services and anything installed without a shortcut. Each prefix (`~/.wine`, `$WINEPREFIX`, `~/.local/share/wineprefixes/*`, every Bottles bottle, PlayOnLinux) has the real list in its registry files: the `…\CurrentVersion\Uninstall\*` keys in `system.reg`/`user.reg`, which is exactly what `wine uninstaller` shows. The app reads those (skipping `SystemComponent` entries, updates and Wine's own Mono/Gecko), then:
+
+- groups a program's menu entries (same Start-menu folder, or working folders inside each other) and joins them to the registry entry by name, or by folder when the names differ
+- finds the program's folder from `InstallLocation`, else the uninstaller's or icon's folder, else a `Program Files` folder named like the program or `Publisher\Program` (MSI installs often record no path), never one another entry already owns
+- sizes that folder, and flags **leftovers**: the folder it names is gone, or all that's left is its uninstaller
+- marks Visual C++ / .NET / Access-engine runtimes as runtimes, not apps
+
+**5. Software with no launcher at all**
+
+AppImages anywhere in your home folder (3 levels deep, hidden and build folders skipped), `~/.local/bin` and `/opt`; folders in `/opt` and files in `/usr/local/{bin,sbin}` that dpkg doesn't own (root-only folders there are service state, like containerd's, and are skipped; a folder with nothing runnable left is a leftover); executables in `~/.local/bin`, `~/bin` and `~/go/bin` (several names for one file make one row); `pipx` venvs, global `npm` packages (system and every nvm Node), `cargo install` crates and rustup toolchains.
+
+Whole scan on my machine (~3,000 entries, ~100 apps, sizing about 15 GB of unpackaged software): **6–9 s** on this fanless laptop while a browser keeps both cores busy, against 12–16 s for the old version that found far less. Most of the gain is reading APT's state file instead of running `apt-mark`, and asking dpkg about launcher files and the programs they run in **one** `dpkg-query -S` call (each call spends ~0.7 s just loading dpkg's database). The package-manager listings run in parallel. The folder walks don't, because Python threads gain nothing on them (the GIL): tried, it was slower.
+
+The result is saved to `~/.cache/app-manager/scan.json` (only readable by you), and the next launch shows it immediately while the fresh scan runs.
+
+### Clean up
+
+| Category | How it's found | What the button runs |
+|---|---|---|
+| Unused packages | `apt-get -s autoremove` (a dry run) | `pkexec apt-get remove -y <exactly those packages>` |
+| Leftover settings | dpkg status `rc`, minus anything of the running kernel. Sizes come from `/lib/modules/<version>` | `pkexec apt-get purge -y <those packages>` |
+| Downloaded package files | `*.deb` in `/var/cache/apt/archives` | `pkexec apt-get clean` |
+| Unused Flatpak runtimes | `flatpak uninstall --unused`, answered "n" at its own prompt. Flatpak has no dry run, and this way its own rules (pins, extensions) decide | `flatpak uninstall --unused -y` (with `pkexec` for the system installation) |
+| Leftovers from removed apps | the scan's leftover flags | nothing directly: each links to its row |
+
+It's computed when you first open the page, because APT's dry run can take 20 s on a busy laptop and isn't worth paying at every start.
+
+### Startup apps
+
+Autostart entries come from `~/.config/autostart` and every `$XDG_CONFIG_DIRS/autostart` (Zorin adds `/etc/xdg/xdg-zorin`). A user file with the same name as a system entry is that entry's *setting*, so it's merged into one row. Deleting it would silently turn the system entry back on, which is what an earlier version's trash button did while its dialog said the opposite. For each entry the app works out whether the session would really start it: `OnlyShowIn`/`NotShowIn` against `$XDG_CURRENT_DESKTOP`, `TryExec`, and `AutostartCondition` (`GSettings schema key`, `if-exists`, `unless-exists`). `X-GNOME-Autostart-Phase` marks the ones the desktop itself needs.
 
 ### Icons
 
@@ -253,9 +318,13 @@ Inside `app-manager.py`, top to bottom:
 | enumeration | `list_apt()`, `list_snap()`, `list_flatpak()`, `list_all()` |
 | launchers | `application_dirs()`, `scan_launchers()`, `attach_launchers()`, `.desktop` parsing, Exec-line parsing |
 | removal planning | `simulate_apt_remove()`, `remove_command()` |
-| autostart | `list_autostart()`, `set_autostart_enabled()`, `remove_autostart()` |
+| Windows programs | `wine_prefixes()`, `read_uninstall_entries()`, `windows_programs()` |
+| unmanaged software | `list_unpackaged()`, `find_appimages()`, `vendor_paths()`, `local_action()`, `trash_paths()`, `restore_from_trash()` |
+| clean-up | `cleanup_report()`, `verify_cleanup()` |
+| scan cache | `save_scan()`, `load_scan()` |
+| autostart | `list_autostart()`, `_autostart_skip_reason()`, `set_autostart_enabled()`, `remove_autostart()` |
 | system monitor | `SystemSampler` (one reading = `sample()`), `cpu_model()`, `list_gpus()`, `_hwmon_temps()`, `_friendly_temps()`, `_gpu_reading()` |
-| CLI | `--list`, `--apps`, `--json`, `--check`, `--monitor` |
+| CLI | `--list`, `--apps`, `--json`, `--check`, `--monitor`, `--startup`, `--cleanup` |
 | GUI | `_VIEWS` (sidebar sections), `_CSS` (the stylesheet), `_VIZ`/`_METER_CSS` (chart and meter colours), `run_gui()`: window, sidebar, rows, details panel, dialogs, `MeterRow`/`StatTile`/`HistoryChart` |
 
 The backend functions don't import GTK, so you can import the file and use them from another script.
@@ -266,9 +335,14 @@ The backend functions don't import GTK, so you can import the file and use them 
 
 - **Only this machine.** It reads the local system. Scanning a remote box over SSH isn't there (yet).
 - **Other users' per-user installs aren't visible.** Flatpaks installed with `--user` by *another* account, or launchers in another user's home, need that user's session (or root) to read. System-wide stuff is covered.
-- **"Other" apps can't be removed from the app**, on purpose (see the safety section). A "move to trash" option for AppImages and user launchers would be safe and reversible. That's on the list.
+- **Some "Other" things still can't be removed from the app**, on purpose: web apps (use the browser's apps page), and vendor installs in `/opt` or `/usr/local` (they need root plus the vendor's own steps). Symlinked CLI tools like `claude` aren't trashed either, since that would only remove the link.
+- **Untested here:** Clean up's parsing of Flatpak's list of unused runtimes, because this machine has none. If the format differs, the card just shows nothing to clean. Also untested is actually running the `pipx`/`npm`/`cargo`/`rustup` uninstalls and the clean-up commands, since I didn't want to remove real software to prove it. Their dialogs and checks were exercised, and the Trash/Undo path was tested end to end on throwaway files.
+- **Old snap revisions aren't cleaned up.** snapd keeps two per snap for rollback, and removing them takes one `pkexec` prompt each.
+- **Windows-program details are best-effort.** The registry list itself is exact, but matching it to menu entries and finding the program's folder are heuristics (name and folder matching). A program that registered no uninstall entry and has no menu entry (a portable `.exe` you copied in) can't be found. Steam/Proton games are left to Steam.
+- **Not covered:** `pip install --user` packages (mostly libraries), Docker/Podman images and containers, Nix and Homebrew, and the Node.js versions nvm itself installed (their global `npm` packages are listed).
 - **apt/dpkg-based distros only** for native packages. Fedora (`dnf`/`rpm`), Arch (`pacman`) and openSUSE (`zypper`) aren't supported. Snap and flatpak work anywhere.
-- **"Installed by you" is apt's opinion.** It's `apt-mark showmanual`, which also counts things the installer marked manual during OS setup.
+- **"Installed by you" is apt's opinion.** It's what `apt-mark showmanual` says, which also counts things the installer marked manual during OS setup.
+- **The install date of a `.deb` is "installed or last updated".** dpkg keeps no separate install time.
 - **Snap/flatpak dependency cascades aren't previewed** the way apt's are. Removing a flatpak app leaves its runtime in place (`flatpak uninstall --unused` cleans that up), and snap base snaps are protected anyway.
 - The protected list is tuned for Ubuntu-family GNOME desktops (Zorin, Ubuntu, Pop!_OS-ish). On KDE or XFCE you'd want to add `plasma-*` / `xfce4-*` etc. to `_PROTECTED_RE`.
 - Only tested on Zorin OS 18 (GNOME, Wayland). It should work on Ubuntu 22.04+ and Mint, but I haven't tried.
